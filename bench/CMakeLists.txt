@@ -1,37 +1,83 @@
-# Benchmarks CMakeLists.txt
+cmake_minimum_required(VERSION 3.14)
+project(memento_benchmarks)
 
-# Basic benchmarks
-add_executable(bench_allocation bench_allocation.c)
-target_link_libraries(bench_allocation m)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-add_executable(bench_throughput bench_throughput.c)
-target_link_libraries(bench_throughput m)
+# Include FetchContent for external dependencies
+include(FetchContent)
 
-add_executable(bench_fragmentation bench_fragmentation.c)
-target_link_libraries(bench_fragmentation m)
+# nanobench for benchmarking
+FetchContent_Declare(
+    nanobench
+    GIT_REPOSITORY https://github.com/martinus/nanobench.git
+    GIT_TAG v4.3.11
+)
+FetchContent_MakeAvailable(nanobench)
 
-# C++ benchmarks
-add_executable(bench_cpp_basic bench_cpp_basic.cpp)
-target_link_libraries(bench_cpp_basic m)
+# mimalloc for comparison
+FetchContent_Declare(
+    mimalloc
+    GIT_REPOSITORY https://github.com/microsoft/mimalloc.git
+    GIT_TAG v2.1.2
+)
+FetchContent_MakeAvailable(mimalloc)
 
-add_executable(bench_cpp_stl bench_cpp_stl.cpp)
-target_link_libraries(bench_cpp_stl m)
+# rpmalloc for comparison  
+FetchContent_Declare(
+    rpmalloc
+    GIT_REPOSITORY https://github.com/mjansson/rpmalloc.git
+    GIT_TAG 1.4.4
+)
+FetchContent_MakeAvailable(rpmalloc)
 
-# Threading benchmarks (if available)
-find_package(Threads)
-if(Threads_FOUND)
-    add_executable(bench_threads bench_threads.c)
-    target_link_libraries(bench_threads m Threads::Threads)
+# rpmalloc needs to be built as a library
+add_library(rpmalloc STATIC
+    ${rpmalloc_SOURCE_DIR}/rpmalloc/rpmalloc.c
+    ${rpmalloc_SOURCE_DIR}/rpmalloc/rpmalloc.h
+)
+target_include_directories(rpmalloc PUBLIC ${rpmalloc_SOURCE_DIR})
+# rpmalloc requires C11 and generates warnings we need to suppress
+set_property(TARGET rpmalloc PROPERTY C_STANDARD 11)
+target_compile_options(rpmalloc PRIVATE 
+    -Wno-c11-extensions 
+    -Wno-static-in-inline 
+    -Wno-excess-initializers
+)
+
+# Add include directories
+include_directories(
+    ${CMAKE_SOURCE_DIR}/../include
+    ${nanobench_SOURCE_DIR}/src/include
+    ${mimalloc_SOURCE_DIR}/include
+    ${rpmalloc_SOURCE_DIR}/include
+)
+
+# Add benchmark executable
+add_executable(benchmark_all
+    benchmark_all.cpp
+)
+
+# Link libraries
+target_link_libraries(benchmark_all
+    nanobench
+    mimalloc-static
+    rpmalloc
+)
+
+# Platform-specific linking
+if(WIN32)
+    target_link_libraries(benchmark_all psapi)
+elseif(APPLE)
+    target_link_libraries(benchmark_all pthread)
+else()
+    target_link_libraries(benchmark_all pthread dl)
 endif()
 
-# Performance comparison vs system malloc
-add_executable(bench_comparison bench_comparison.c)
-target_link_libraries(bench_comparison m)
-
-# Set benchmark properties
-set_target_properties(
-    bench_allocation bench_throughput bench_fragmentation
-    bench_cpp_basic bench_cpp_stl bench_threads bench_comparison
-    PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bench"
+# Add custom target to build and run benchmarks
+add_custom_target(run_benchmarks
+    COMMAND benchmark_all
+    DEPENDS benchmark_all
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running comprehensive benchmarks..."
 )

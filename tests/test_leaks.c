@@ -70,8 +70,7 @@ TEST(proxy_leak_tracking) {
     ASSERT_NOT_NULL(backing);
     
     /* Get initial stats */
-    const memento_stats_t* initial_backing_stats = memento_get_stats(backing);
-    size_t initial_backing_allocs = initial_backing_stats->allocation_count;
+    /* const memento_stats_t* initial_backing_stats = memento_get_stats(backing); // For future leak detection */
     
     memento_allocator_t* proxy = memento_create_proxy_allocator("proxy_leak", backing);
     ASSERT_NOT_NULL(proxy);
@@ -246,3 +245,4 @@ int main(void) {
     
     return (test_count == pass_count) ? 0 : 1;
 }
+

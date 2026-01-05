@@ -378,7 +378,7 @@ TEST(error_handling) {
     
     /* Test invalid alignment */
     try {
-        allocator.allocate(1024, 3);  /* Not power of two */
+        static_cast<void>(allocator.allocate(1024, 3));  /* Not power of two */
         ASSERT(false);  /* Should not reach here */
     } catch (const std::invalid_argument&) {
         /* Expected */
@@ -386,7 +386,7 @@ TEST(error_handling) {
     
     /* Test excessive alignment */
     try {
-        allocator.allocate(1024, MEMENTO_MAX_ALIGNMENT * 2);
+        static_cast<void>(allocator.allocate(1024, MEMENTO_MAX_ALIGNMENT * 2));
         ASSERT(false);  /* Should not reach here */
     } catch (const std::invalid_argument&) {
         /* Expected */
@@ -395,7 +395,7 @@ TEST(error_handling) {
     /* Test allocation error */
     try {
         /* Try to allocate an enormous amount */
-        allocator.allocate(SIZE_MAX);
+        static_cast<void>(allocator.allocate(SIZE_MAX));
         ASSERT(false);  /* Should not reach here */
     } catch (const memento::allocation_error& e) {
         /* Expected */

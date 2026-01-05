@@ -27,7 +27,7 @@ static void application_layer(memento_allocator_t* app_allocator) {
     memento_result_t result = memento_alloc(app_allocator, sizeof(struct AppConfig));
     if (result.success) {
         struct AppConfig* config = (struct AppConfig*)result.ptr;
-        printf("    Created app config at %p\n", config);
+        printf("    Created app config at %p\n", (void*)config);
         
         strcpy(config->app_name, "MyApplication");
         config->version = 100;
@@ -53,7 +53,7 @@ static void game_engine_layer(memento_allocator_t* engine_allocator) {
     memento_result_t result = memento_alloc(engine_allocator, sizeof(struct GameState));
     if (result.success) {
         struct GameState* state = (struct GameState*)result.ptr;
-        printf("    Created game state at %p\n", state);
+        printf("    Created game state at %p\n", (void*)state);
         
         state->current_level = 1;
         state->player_health = 100;
@@ -80,7 +80,7 @@ static void rendering_layer(memento_allocator_t* render_allocator) {
     memento_result_t result = memento_alloc(render_allocator, sizeof(struct RenderResources));
     if (result.success) {
         struct RenderResources* resources = (struct RenderResources*)result.ptr;
-        printf("    Created render resources at %p\n", resources);
+        printf("    Created render resources at %p\n", (void*)resources);
         
         resources->buffer_count = 0;
         resources->texture_count = 0;
@@ -119,7 +119,7 @@ static void ui_layer(memento_allocator_t* ui_allocator) {
         memento_result_t result = memento_alloc(ui_allocator, sizeof(struct UIElement));
         if (result.success) {
             struct UIElement* element = (struct UIElement*)result.ptr;
-            printf("    Created UI element %d at %p\n", i, element);
+            printf("    Created UI element %d at %p\n", i, (void*)element);
             
             strcpy(element->type, element_types[i]);
             element->position[0] = (float)(i * 100);

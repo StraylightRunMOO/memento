@@ -62,7 +62,7 @@ public:
         
         /* Return the pre-allocated object with custom deleter */
         return std::unique_ptr<T, std::function<void(T*)>>(obj, 
-            [this](T* ptr) { /* Object returned to pool automatically */ });
+            [](T* /* ptr */) { /* Object returned to pool automatically */ });
     }
     
     size_t available() const { return available_objects_.size(); }
@@ -96,7 +96,7 @@ public:
         active_ = false;
     }
     
-    void update(float delta_time) {
+    void update(float /* delta_time */) {
         if (active_) {
             /* Entity update logic */
             std::cout << "     PooledEntity " << id_ << " updated\n";

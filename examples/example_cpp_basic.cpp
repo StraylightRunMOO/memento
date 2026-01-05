@@ -178,7 +178,7 @@ void demonstrate_error_handling() {
     /* Try invalid alignment */
     try {
         std::cout << "   Trying invalid alignment (3 bytes)..." << std::endl;
-        allocator.allocate(100, 3);  /* Not power of two */
+        static_cast<void>(allocator.allocate(100, 3));  /* Not power of two */
         std::cout << "   ERROR: Should have thrown exception!" << std::endl;
     } catch (const std::invalid_argument& e) {
         std::cout << "   Caught expected exception: " << e.what() << std::endl;
@@ -187,7 +187,7 @@ void demonstrate_error_handling() {
     /* Try excessive size */
     try {
         std::cout << "   Trying excessive allocation size..." << std::endl;
-        allocator.allocate(SIZE_MAX);
+        static_cast<void>(allocator.allocate(SIZE_MAX));
         std::cout << "   ERROR: Should have thrown exception!" << std::endl;
     } catch (const memento::allocation_error& e) {
         std::cout << "   Caught allocation error: " << e.what() << std::endl;

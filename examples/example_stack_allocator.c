@@ -74,7 +74,7 @@ static Mesh* create_mesh(memento_allocator_t* allocator, size_t vertex_count, si
         mesh->indices[i] = (uint32_t)(i % vertex_count);
     }
     
-    printf("    Mesh created at %p\n", mesh);
+    printf("    Mesh created at %p\n", (void*)mesh);
     return mesh;
 }
 

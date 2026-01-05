@@ -25,7 +25,7 @@ static void graphics_subsystem(memento_allocator_t* allocator) {
     memento_result_t result = memento_alloc(allocator, sizeof(struct Vertex) * 1000);
     if (result.success) {
         struct Vertex* vertices = (struct Vertex*)result.ptr;
-        printf("    Allocated %zu bytes for vertex data at %p\n", result.size, vertices);
+        printf("    Allocated %zu bytes for vertex data at %p\n", result.size, (void*)vertices);
         
         /* Initialize some vertex data */
         for (int i = 0; i < 1000; i++) {
@@ -55,7 +55,7 @@ static void physics_subsystem(memento_allocator_t* allocator) {
         memento_result_t result = memento_alloc(allocator, sizeof(struct PhysicsBody));
         if (result.success) {
             struct PhysicsBody* body = (struct PhysicsBody*)result.ptr;
-            printf("    Created physics body %d at %p\n", i, body);
+            printf("    Created physics body %d at %p\n", i, (void*)body);
             
             body->position[0] = (float)(i * 10);
             body->position[1] = 0.0f;
@@ -83,7 +83,7 @@ static void audio_subsystem(memento_allocator_t* allocator) {
     memento_result_t result = memento_alloc(allocator, sizeof(struct AudioSample));
     if (result.success) {
         struct AudioSample* sample = (struct AudioSample*)result.ptr;
-        printf("    Created audio sample at %p\n", sample);
+        printf("    Created audio sample at %p\n", (void*)sample);
         
         sample->length = 44100; /* 1 second at 44.1kHz */
         sample->channels = 2;

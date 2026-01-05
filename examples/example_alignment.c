@@ -81,7 +81,7 @@ static void demonstrate_struct_alignment(void) {
     memento_result_t result16 = memento_alloc_aligned(alloc, sizeof(AlignedData16), 16);
     if (result16.success) {
         AlignedData16* data16 = (AlignedData16*)result16.ptr;
-        printf("    16-byte aligned data at %p\n", data16);
+        printf("    16-byte aligned data at %p\n", (void*)data16);
         
         /* Initialize with SIMD-friendly pattern */
         for (int i = 0; i < 16; i++) {
@@ -95,7 +95,7 @@ static void demonstrate_struct_alignment(void) {
     memento_result_t vec_result = memento_alloc_aligned(alloc, sizeof(Vector4), 16);
     if (vec_result.success) {
         Vector4* vec = (Vector4*)vec_result.ptr;
-        printf("    16-byte aligned Vector4 at %p\n", vec);
+        printf("    16-byte aligned Vector4 at %p\n", (void*)vec);
         
         vec->x = 1.0f; vec->y = 2.0f; vec->z = 3.0f; vec->w = 4.0f;
         printf("      Values: (%.1f, %.1f, %.1f, %.1f)\n", vec->x, vec->y, vec->z, vec->w);
@@ -107,7 +107,7 @@ static void demonstrate_struct_alignment(void) {
     memento_result_t double_result = memento_alloc_aligned(alloc, sizeof(DoubleVector), 16);
     if (double_result.success) {
         DoubleVector* dvec = (DoubleVector*)double_result.ptr;
-        printf("    16-byte aligned DoubleVector at %p\n", dvec);
+        printf("    16-byte aligned DoubleVector at %p\n", (void*)dvec);
         
         dvec->values[0] = 1.0; dvec->values[1] = 2.0;
         printf("      Values: [%.1f, %.1f]\n", dvec->values[0], dvec->values[1]);
@@ -136,7 +136,7 @@ static void demonstrate_cache_line_alignment(void) {
         memento_result_t result = memento_alloc_aligned(alloc, sizeof(CacheLineData), 32);
         if (result.success) {
             CacheLineData* cache_data = (CacheLineData*)result.ptr;
-            printf("    Cache line data %d at %p (32-byte aligned)\n", i, cache_data);
+            printf("    Cache line data %d at %p (32-byte aligned)\n", i, (void*)cache_data);
             
             /* Initialize cache data */
             for (int j = 0; j < 4; j++) {

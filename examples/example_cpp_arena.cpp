@@ -72,7 +72,7 @@ public:
         std::cout << "      Enemy created with damage: " << damage_ << "\n";
     }
     
-    void update(float delta_time) override {
+    void update(float /* delta_time */) override {
         /* Simple enemy AI */
         if (active_) {
             /* Move towards player (simplified) */
@@ -313,9 +313,15 @@ static void demonstrate_game_system(void) {
     Enemy* goblin = game.spawnEnemy("Goblin", 25.0f);
     Enemy* orc = game.spawnEnemy("Orc", 50.0f);
     
+    /* Verify entities were created (suppress unused variable warnings) */
+    (void)player; (void)goblin; (void)orc;
+    
     /* Fire some projectiles */
     Projectile* fireball = game.fireProjectile("Fireball", 10.0f, 0.0f, 0.0f);
     Projectile* arrow = game.fireProjectile("Arrow", 15.0f, 5.0f, 0.0f);
+    
+    /* Verify projectiles were created */
+    (void)fireball; (void)arrow;
     
     std::cout << "\n   Initial game state:\n";
     game.printStatistics();

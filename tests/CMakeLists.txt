@@ -1,12 +1,12 @@
 # Tests CMakeLists.txt
 
 # C Tests
-add_executable(test_memento_c ../test_memento.c)
+add_executable(test_memento_c test_memento.c)
 target_link_libraries(test_memento_c m)
 add_test(NAME test_memento_c COMMAND test_memento_c)
 
 # C++ Tests
-add_executable(test_memento_cpp ../test_memento_cpp.cpp)
+add_executable(test_memento_cpp test_memento_cpp.cpp)
 target_link_libraries(test_memento_cpp m)
 add_test(NAME test_memento_cpp COMMAND test_memento_cpp)
 

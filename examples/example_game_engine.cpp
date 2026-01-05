@@ -24,7 +24,7 @@ class Entity;
 class Component {
 public:
     virtual ~Component() = default;
-    virtual void update(float delta_time) {}
+    virtual void update(float /* delta_time */) {}
     virtual void print() const = 0;
 };
 
@@ -208,7 +208,7 @@ public:
         auto player = createEntity(name);
         
         /* Add transform component using graphics allocator */
-        auto transform = graphics_allocator_.construct<TransformComponent>(x, y, z);
+        /* auto transform = graphics_allocator_.construct<TransformComponent>(x, y, z); // Unused */
         player->addComponent<TransformComponent>(x, y, z);
         
         /* Add mesh component using graphics allocator */
@@ -312,17 +312,17 @@ int main(void) {
         std::cout << "Creating game entities...\n\n";
         
         /* Create player */
-        auto player = engine.createPlayer("Hero", 0.0f, 1.0f, 0.0f);
+        /* auto player = engine.createPlayer("Hero", 0.0f, 1.0f, 0.0f); // Unused for demo */
         
         /* Create enemies */
-        auto enemy1 = engine.createEnemy("Goblin", 10.0f, 0.0f, 5.0f);
-        auto enemy2 = engine.createEnemy("Orc", -15.0f, 0.0f, -8.0f);
+        /* auto enemy1 = engine.createEnemy("Goblin", 10.0f, 0.0f, 5.0f); // Unused for demo */
+        /* auto enemy2 = engine.createEnemy("Orc", -15.0f, 0.0f, -8.0f); // Unused for demo */
         
         /* Create props (environment objects) */
-        auto tree1 = engine.createProp("Tree1", "tree_model.obj", "bark_material.mat");
-        auto tree2 = engine.createProp("Tree2", "tree_model.obj", "bark_material.mat");
-        auto rock1 = engine.createProp("Rock1", "rock_model.obj", "stone_material.mat");
-        auto building = engine.createProp("House", "house_model.obj", "wood_material.mat");
+        /* auto tree1 = engine.createProp("Tree1", "tree_model.obj", "bark_material.mat"); // Unused for demo */
+        /* auto tree2 = engine.createProp("Tree2", "tree_model.obj", "bark_material.mat"); // Unused for demo */
+        /* auto rock1 = engine.createProp("Rock1", "rock_model.obj", "stone_material.mat"); // Unused for demo */
+        /* auto building = engine.createProp("House", "house_model.obj", "wood_material.mat"); // Unused for demo */
         
         std::cout << "\nInitial game state:\n";
         engine.printEntities();

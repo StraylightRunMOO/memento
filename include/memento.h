@@ -224,7 +224,7 @@ static struct {
     memento_config_t config;
     memento_allocator_t* root_allocator;
     void* thread_cache;  /* Implementation-specific thread cache */
-} g_memento = {0};
+} g_memento = {false, {false, false, false, false, 0, 0, 0, 0, 0, 0, 0}, NULL, NULL};
 
 /* Memory alignment utilities */
 MEMENTO_FORCE_INLINE size_t memento_align_up(size_t value, size_t alignment) {

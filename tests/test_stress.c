@@ -205,12 +205,11 @@ TEST(mixed_allocator_stress) {
     /* Use different allocators in sequence */
     for (int i = 0; i < 1000; i++) {
         memento_allocator_t* alloc;
-        const char* name;
         
         switch (i % 3) {
-            case 0: alloc = thread_cache; name = "thread"; break;
-            case 1: alloc = block; name = "block"; break;
-            case 2: alloc = proxy; name = "proxy"; break;
+            case 0: alloc = thread_cache; break;
+            case 1: alloc = block; break;
+            case 2: alloc = proxy; break;
         }
         
         size_t size = (i % 10 + 1) * 100;
@@ -254,3 +253,4 @@ int main(void) {
     
     return (test_count == pass_count) ? 0 : 1;
 }
+
