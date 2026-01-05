@@ -8,7 +8,7 @@
 #include <assert.h>
 
 #define MEMENTO_IMPLEMENTATION
-#include "../memento.h"
+#include "../include/memento.h"
 
 static int test_count = 0;
 static int pass_count = 0;

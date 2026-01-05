@@ -549,10 +549,10 @@ static memento_result_t memento_block_allocate(memento_allocator_t* allocator, s
         return result;
     }
     
-    /* For now, ignore alignment requirements (simple implementation) */
-    (void)alignment;
-    
-    uint32_t need_size = (uint32_t)(size + sizeof(memento_block_chunk_t));
+    /* Calculate total size needed: user data + alignment padding + metadata */
+    /* Always allocate extra space for alignment and original pointer storage */
+    size_t extra_space = sizeof(void*) + alignment;  /* space for original pointer + max alignment */
+    uint32_t need_size = (uint32_t)(size + sizeof(memento_block_chunk_t) + extra_space);
     need_size = (need_size + MEMENTO_CHUNK_ALIGNMENT - 1) & ~(MEMENTO_CHUNK_ALIGNMENT - 1);
     
     /* Try recycler ring first */
@@ -596,7 +596,20 @@ static memento_result_t memento_block_allocate(memento_allocator_t* allocator, s
     }
     block->data.block_list = block_header;
     
-    result.ptr = memento_block_chunk_ptr(chunk);
+    void* raw_ptr = memento_block_chunk_ptr(chunk);
+    
+    /* Calculate the aligned pointer */
+    void* aligned_ptr = memento_align_pointer(raw_ptr, alignment);
+    
+    /* If we need to shift for alignment, store the original pointer */
+    if (aligned_ptr != raw_ptr) {
+        /* Store the original pointer right before the aligned pointer */
+        void** original_ptr_storage = (void**)((char*)aligned_ptr - sizeof(void*));
+        *original_ptr_storage = raw_ptr;
+    }
+    
+    result.ptr = aligned_ptr;
+    
     result.success = true;
     block->base.stats.block_allocations++;
     
@@ -608,7 +621,28 @@ static void memento_block_deallocate(memento_allocator_t* allocator, void* ptr) 
     
     if (!ptr) return;
     
-    memento_block_chunk_t* chunk = memento_block_ptr_to_chunk(ptr);
+    /* Recover the original pointer */
+    void* original_ptr = ptr;
+    
+    /* Check if this pointer was aligned by looking for a stored original pointer */
+    void** potential_original = (void**)((char*)ptr - sizeof(void*));
+    
+    /* Check if the value stored there points to a valid chunk (simple heuristic) */
+    void* candidate_original = *potential_original;
+    memento_block_chunk_t* candidate_chunk = memento_block_ptr_to_chunk(candidate_original);
+    
+    /* Verify this looks like a valid chunk by checking if it's within our blocks */
+    memento_block_header_t* header = block->data.block_list;
+    while (header) {
+        if ((char*)candidate_chunk >= (char*)header + sizeof(memento_block_header_t) &&
+            (char*)candidate_chunk < (char*)header + MEMENTO_BLOCK_SIZE) {
+            original_ptr = candidate_original;
+            break;
+        }
+        header = header->next;
+    }
+    
+    memento_block_chunk_t* chunk = memento_block_ptr_to_chunk(original_ptr);
     chunk->used = 0;
     
     memento_block_merge_right(&block->data, chunk);

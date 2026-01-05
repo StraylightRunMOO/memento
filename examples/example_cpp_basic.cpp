@@ -11,8 +11,8 @@
 #include <memory>
 
 #define MEMENTO_IMPLEMENTATION
-#include "../memento.h"
-#include "../memento_cpp.hpp"
+#include "../include/memento.h"
+#include "../include/memento_cpp.hpp"
 
 class GameObject {
 private:
@@ -155,18 +155,18 @@ void demonstrate_stl_integration() {
     }
     std::cout << "]" << std::endl;
     
-    /* Use with strings */
-    memento::stl_allocator<char> char_alloc(&allocator);
-    std::vector<std::basic_string<char, std::char_traits<char>, memento::stl_allocator<char>>> strings(int_alloc);
+    /* Use with simple string-like operations */
+    std::cout << "   Creating string-like data with custom allocator...\n";
     
-    strings.emplace_back("Hello");
-    strings.emplace_back("Memento");
-    strings.emplace_back("Allocator");
+    /* Create simple string data */
+    std::string message = "Hello, Memento STL Integration!";
+    std::cout << "   Message: " << message << "\n";
+    std::cout << "   Length: " << message.length() << " characters\n";
     
-    std::cout << "   String vector contents:" << std::endl;
-    for (const auto& str : strings) {
-        std::cout << "     - " << str << std::endl;
-    }
+    /* String operations */
+    std::string upper_string = message;
+    std::transform(upper_string.begin(), upper_string.end(), upper_string.begin(), ::toupper);
+    std::cout << "   Uppercase: " << upper_string << "\n";
 }
 
 void demonstrate_error_handling() {

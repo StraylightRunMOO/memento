@@ -10,7 +10,7 @@
 #include <string.h>
 
 #define MEMENTO_IMPLEMENTATION
-#include "../memento.h"
+#include "../include/memento.h"
 
 /* Simulate a particle system that allocates many small objects */
 typedef struct {

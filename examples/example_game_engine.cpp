@@ -13,13 +13,20 @@
 #include <chrono>
 
 #define MEMENTO_IMPLEMENTATION
-#include "../memento.h"
-#include "../memento_cpp.hpp"
+#include "../include/memento.h"
+#include "../include/memento_cpp.hpp"
 
 // Forward declarations
 class GameEngine;
 class Entity;
-class Component;
+
+// Base component class
+class Component {
+public:
+    virtual ~Component() = default;
+    virtual void update(float delta_time) {}
+    virtual void print() const = 0;
+};
 
 // Component types
 class TransformComponent : public Component {
@@ -103,14 +110,6 @@ public:
     }
 };
 
-// Base component class
-class Component {
-public:
-    virtual ~Component() = default;
-    virtual void update(float delta_time) {}
-    virtual void print() const = 0;
-};
-
 // Entity class that uses memento allocation
 class Entity {
 private:
@@ -135,7 +134,7 @@ public:
     template<typename T, typename... Args>
     T* addComponent(Args&&... args) {
         auto component = allocator_->construct<T>(std::forward<Args>(args)...);
-        components_.emplace_back(component, allocator_);
+        components_.emplace_back(static_cast<Component*>(component), allocator_);
         return component;
     }
     
@@ -182,7 +181,7 @@ public:
         , system_allocator_(memento::allocator::create_proxy("system", &root_allocator_))
         , graphics_allocator_(memento::allocator::create_block("graphics", &system_allocator_))
         , physics_allocator_(memento::allocator::create_block("physics", &system_allocator_))
-        , audio_allocator_(memento::allocator::create_thread_cache("audio", &system_allocator_))
+        , audio_allocator_(memento::allocator::create_thread_cache("audio"))
         , random_gen_(std::chrono::steady_clock::now().time_since_epoch().count()) {
         
         std::cout << "Game Engine initialized with hierarchical allocators:\n";

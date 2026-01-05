@@ -10,7 +10,7 @@
 #include <string.h>
 
 #define MEMENTO_IMPLEMENTATION
-#include "../memento.h"
+#include "../include/memento.h"
 
 /* Simulate some work that allocates memory */
 static void do_work(memento_allocator_t* allocator, int worker_id) {

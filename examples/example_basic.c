@@ -9,7 +9,7 @@
 #include <string.h>
 
 #define MEMENTO_IMPLEMENTATION
-#include "../memento.h"
+#include "../include/memento.h"
 
 int main(void) {
     printf("Memento Basic Usage Example\n");

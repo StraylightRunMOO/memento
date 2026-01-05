@@ -352,7 +352,7 @@ public:
         }
     }
     
-    stl_allocator() = delete;
+    stl_allocator() noexcept : allocator_(nullptr) {}
     
     // Copy constructor from different type
     template<typename U>
@@ -360,11 +360,16 @@ public:
     
     // Allocation
     [[nodiscard]] T* allocate(size_type n) {
+        if (!allocator_) {
+            throw std::runtime_error("STL allocator not properly initialized");
+        }
         return static_cast<T*>(allocator_->allocate(n * sizeof(T), alignof(T)));
     }
     
     void deallocate(T* ptr, size_type) noexcept {
-        allocator_->deallocate(ptr);
+        if (allocator_) {
+            allocator_->deallocate(ptr);
+        }
     }
     
     size_type max_size() const noexcept {
