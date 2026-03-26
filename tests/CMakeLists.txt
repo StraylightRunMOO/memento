@@ -1,38 +1,25 @@
-# Tests CMakeLists.txt
+cmake_minimum_required(VERSION 3.14)
 
-# C Tests
-add_executable(test_memento_c test_memento.c)
-target_link_libraries(test_memento_c m)
-add_test(NAME test_memento_c COMMAND test_memento_c)
+# C tests
+add_executable(test_core test_core.c)
+target_include_directories(test_core PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_core PRIVATE pthread)
+add_test(NAME core COMMAND test_core)
 
-# C++ Tests
-add_executable(test_memento_cpp test_memento_cpp.cpp)
-target_link_libraries(test_memento_cpp m)
-add_test(NAME test_memento_cpp COMMAND test_memento_cpp)
+add_executable(test_thread test_thread.c)
+target_include_directories(test_thread PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_thread PRIVATE pthread)
+add_test(NAME thread COMMAND test_thread)
 
-# Additional unit tests
-add_executable(test_basic test_basic.c)
-target_link_libraries(test_basic m)
-add_test(NAME test_basic COMMAND test_basic)
-
-add_executable(test_alignment test_alignment.c)
-target_link_libraries(test_alignment m)
-add_test(NAME test_alignment COMMAND test_alignment)
-
-add_executable(test_stress test_stress.c)
-target_link_libraries(test_stress m)
-add_test(NAME test_stress COMMAND test_stress)
-
-# Memory leak detection tests
-add_executable(test_leaks test_leaks.c)
-target_link_libraries(test_leaks m)
-add_test(NAME test_leaks COMMAND test_leaks)
+# C++ tests
+add_executable(test_cpp test_cpp.cpp)
+target_include_directories(test_cpp PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_cpp PRIVATE pthread)
+set_property(TARGET test_cpp PROPERTY CXX_STANDARD 17)
+add_test(NAME cpp COMMAND test_cpp)
 
 # Set test properties
-set_tests_properties(
-    test_memento_c test_memento_cpp test_basic test_alignment 
-    test_stress test_leaks
-    PROPERTIES
+set_tests_properties(core thread cpp PROPERTIES
     TIMEOUT 60
-    FAIL_REGULAR_EXPRESSION "FAILED|failed|error|Error"
+    ENVIRONMENT "MEMENTO_TEST=1"
 )

@@ -1,41 +1,57 @@
 /*
  * Memento Memory Allocator Library
  * 
- * A unified, header-only memory allocator library that combines the best features
- * of high-performance allocators into a single, easy-to-use interface.
+ * A high-performance, multi-allocator memory management library.
+ * Non-locking design - no atomics, no locks, completely thread-local.
  * 
  * Features:
- * - Thread-safe high-performance allocation (thread-cache backend)
- * - Hierarchical memory tracking and leak detection (proxy framework)
- * - Block-based allocation with recycling (block allocator)
- * - C99 compatible with optional C++ wrapper
- * - Comprehensive error handling and validation
- * - Performance statistics and debugging support
+ * - Thread Heap: Purely thread-local caching (no atomics!)
+ * - Pool: Fixed-size object pools
+ * - Arena: Bump allocator with power-of-2 growth
+ * - Stack: LIFO scope-based allocator  
+ * - Slab: Multi-size object caching
  * 
- * Usage:
+ * Usage (C):
  *   #define MEMENTO_IMPLEMENTATION
  *   #include "memento.h"
  *   
  *   int main() {
  *       memento_init();
- *       
- *       memento_allocator_t* allocator = memento_create_thread_cache("main");
- *       void* ptr = memento_alloc(allocator, 1024);
- *       // ... use memory ...
- *       memento_free(allocator, ptr);
- *       
- *       memento_destroy_allocator(allocator);
- *       memento_shutdown();
+ *       memento_thread_heap_t* heap = memento_thread_heap_get();
+ *       void* ptr = memento_thread_heap_alloc(heap, 1024);
+ *       memento_thread_heap_free(heap, ptr, 1024);
  *       return 0;
  *   }
+ * 
+ * Usage (C++):
+ *   #include "memento.hpp"
+ *   
+ *   int main() {
+ *       memento::context ctx;
+ *       memento::heap h;
+ *       auto obj = h.construct<MyClass>(args...);
+ *       h.destroy(obj);
+ *       return 0;
+ *   }
+ * 
+ * License: MIT
  */
 
 #ifndef MEMENTO_H
 #define MEMENTO_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+/* Version macros for compile-time checking */
+#define MEMENTO_VERSION_MAJOR 2
+#define MEMENTO_VERSION_MINOR 0
+#define MEMENTO_VERSION_PATCH 0
+#define MEMENTO_VERSION_STRING "2.0.0"
+#define MEMENTO_VERSION ((MEMENTO_VERSION_MAJOR << 16) | \
+                         (MEMENTO_VERSION_MINOR << 8) | \
+                         MEMENTO_VERSION_PATCH)
+
+/* ============================================================================
+ * Standard Headers
+ * ============================================================================ */
 
 #include <stddef.h>
 #include <stdint.h>
@@ -45,7 +61,15 @@ extern "C" {
 #include <stdio.h>
 #include <assert.h>
 
-/* Platform detection and configuration */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/* ============================================================================
+ * Configuration and Platform Detection
+ * ============================================================================ */
+
+/* Platform detection */
 #if defined(_WIN32) || defined(__WIN32__) || defined(_WIN64)
     #define MEMENTO_PLATFORM_WINDOWS 1
     #define MEMENTO_PLATFORM_POSIX 0
@@ -66,903 +90,899 @@ extern "C" {
     #define MEMENTO_NOINLINE __attribute__((noinline))
 #endif
 
-/* Cache line size for performance optimization */
+/* Cache line size (common values: 64 for x86/ARM, 128 for POWER) */
 #ifndef MEMENTO_CACHE_LINE_SIZE
     #define MEMENTO_CACHE_LINE_SIZE 64
 #endif
 
-/* Maximum supported alignment */
-#ifndef MEMENTO_MAX_ALIGNMENT
-    #define MEMENTO_MAX_ALIGNMENT (256 * 1024)
+/* Alignment macro */
+#if defined(_MSC_VER)
+    #define MEMENTO_ALIGNED(x) __declspec(align(x))
+#else
+    #define MEMENTO_ALIGNED(x) __attribute__((aligned(x)))
 #endif
 
-/* Configuration options */
-#ifndef MEMENTO_ENABLE_STATISTICS
-    #ifdef NDEBUG
-        #define MEMENTO_ENABLE_STATISTICS 0
-    #else
-        #define MEMENTO_ENABLE_STATISTICS 1
-    #endif
-#endif
+/* Memory ordering - relaxed since heaps are thread-local */
+#define MEMENTO_MEMORY_ORDER_RELAXED 0
 
-#ifndef MEMENTO_ENABLE_DEBUG_CHECKS
-    #ifdef NDEBUG
-        #define MEMENTO_ENABLE_DEBUG_CHECKS 0
-    #else
-        #define MEMENTO_ENABLE_DEBUG_CHECKS 1
-    #endif
-#endif
+/* ============================================================================
+ * Public API
+ * ============================================================================ */
 
-/* Memory block sizes for block allocator */
-#define MEMENTO_BLOCK_SIZE (8 * 1024 * 1024)  /* 8MB blocks */
-#define MEMENTO_MIN_CHUNK_SIZE 16
-#define MEMENTO_CHUNK_ALIGNMENT 16
-#define MEMENTO_RECYCLE_SLOTS 8
+typedef struct memento_thread_heap_s memento_thread_heap_t;
+typedef struct memento_pool_s memento_pool_t;
+typedef struct memento_arena_s memento_arena_t;
+typedef struct memento_stack_s memento_stack_t;
+typedef struct memento_slab_s memento_slab_t;
 
-/* Error codes */
-typedef enum {
-    MEMENTO_SUCCESS = 0,
-    MEMENTO_ERROR_INVALID_ARGUMENT = -1,
-    MEMENTO_ERROR_OUT_OF_MEMORY = -2,
-    MEMENTO_ERROR_NOT_INITIALIZED = -3,
-    MEMENTO_ERROR_ALREADY_INITIALIZED = -4,
-    MEMENTO_ERROR_THREAD_NOT_INITIALIZED = -5,
-    MEMENTO_ERROR_ALLOCATION_FAILED = -6,
-    MEMENTO_ERROR_INVALID_POINTER = -7,
-    MEMENTO_ERROR_UNSUPPORTED_OPERATION = -8
-} memento_error_t;
+/* Size classes: 32B, 64B, 96B, 128B, 192B, 256B, 384B, 512B, 768B, 1KB, 1.5KB, 2KB, 3KB, 4KB, 6KB, 8KB */
+#define MEMENTO_SIZE_CLASS_COUNT 16
 
-/* Forward declarations */
-typedef struct memento_allocator_t memento_allocator_t;
-typedef struct memento_stats_t memento_stats_t;
-typedef struct memento_config_t memento_config_t;
-
-/* Statistics structure */
-struct memento_stats_t {
-    /* Memory usage statistics */
-    size_t total_allocated;
-    size_t total_deallocated;
-    size_t current_usage;
-    size_t peak_usage;
-    
-    /* Allocation counters */
-    size_t allocation_count;
-    size_t deallocation_count;
-    size_t failed_allocations;
-    
-    /* Thread-specific statistics */
-    size_t thread_cache_hits;
-    size_t thread_cache_misses;
-    size_t block_allocations;
-    size_t block_deallocations;
-};
-
-/* Configuration structure */
-struct memento_config_t {
-    /* General settings */
-    bool enable_statistics;
-    bool enable_debug_checks;
-    bool enable_thread_cache;
-    bool enable_block_allocator;
-    
-    /* Thread cache settings */
-    size_t thread_cache_size;
-    size_t thread_cache_threshold;
-    
-    /* Block allocator settings */
-    size_t block_size;
-    size_t min_chunk_size;
-    size_t max_chunk_size;
-    
-    /* Memory mapping settings */
-    size_t memory_map_threshold;
-    size_t page_size;
-};
-
-/* Allocation result */
+/* Thread-local heap statistics (for debugging/monitoring) */
 typedef struct {
-    void* ptr;
-    size_t size;
-    bool success;
-} memento_result_t;
+    size_t alloc_count;
+    size_t free_count;
+    size_t bytes_allocated;
+    size_t bytes_freed;
+    size_t foreign_free_count;  /* Freed by other threads */
+} memento_heap_stats_t;
 
-/* Allocator function pointers */
-typedef memento_result_t (*memento_allocate_func_t)(memento_allocator_t* allocator, size_t size, size_t alignment);
-typedef void (*memento_deallocate_func_t)(memento_allocator_t* allocator, void* ptr);
-typedef void (*memento_destroy_func_t)(memento_allocator_t* allocator);
+/* ============================================================================
+ * Version API
+ * ============================================================================ */
 
-/* Base allocator structure */
-struct memento_allocator_t {
-    const char* name;
-    memento_stats_t stats;
-    
-    /* Virtual function table */
-    memento_allocate_func_t allocate;
-    memento_deallocate_func_t deallocate;
-    memento_destroy_func_t destroy;
-    
-    /* Allocator-specific data follows */
-};
-
-/* Global initialization and configuration */
-int memento_init(void);
-int memento_shutdown(void);
-bool memento_is_initialized(void);
-const memento_config_t* memento_get_config(void);
-
-/* Core allocation functions */
-memento_result_t memento_alloc(memento_allocator_t* allocator, size_t size);
-memento_result_t memento_alloc_aligned(memento_allocator_t* allocator, size_t size, size_t alignment);
-void memento_free(memento_allocator_t* allocator, void* ptr);
-
-/* Allocator creation and destruction */
-memento_allocator_t* memento_create_thread_cache(const char* name);
-memento_allocator_t* memento_create_block_allocator(const char* name, memento_allocator_t* backing);
-memento_allocator_t* memento_create_proxy_allocator(const char* name, memento_allocator_t* backing);
-memento_allocator_t* memento_create_stack_allocator(const char* name, size_t capacity, memento_allocator_t* backing);
-void memento_destroy_allocator(memento_allocator_t* allocator);
-
-/* Utility functions */
-size_t memento_align_up(size_t value, size_t alignment);
-bool memento_is_power_of_two(size_t value);
-void* memento_align_pointer(void* ptr, size_t alignment);
-
-/* Statistics and debugging */
-void memento_print_stats(const memento_allocator_t* allocator);
-const memento_stats_t* memento_get_stats(const memento_allocator_t* allocator);
-const char* memento_error_string(memento_error_t error);
-
-/* ============================================================================= */
-/* INTERNAL IMPLEMENTATION BEGINS HERE                                         */
-/* ============================================================================= */
-
-#ifdef MEMENTO_IMPLEMENTATION
-
-/* Global state */
-static struct {
-    bool initialized;
-    memento_config_t config;
-    memento_allocator_t* root_allocator;
-    void* thread_cache;  /* Implementation-specific thread cache */
-} g_memento = {false, {false, false, false, false, 0, 0, 0, 0, 0, 0, 0}, NULL, NULL};
-
-/* Memory alignment utilities */
-MEMENTO_FORCE_INLINE size_t memento_align_up(size_t value, size_t alignment) {
-    assert(memento_is_power_of_two(alignment));
-    return (value + alignment - 1) & ~(alignment - 1);
+/* Get version string (e.g., "2.0.0") */
+static inline const char* memento_version_string(void) {
+    return MEMENTO_VERSION_STRING;
 }
 
-MEMENTO_FORCE_INLINE bool memento_is_power_of_two(size_t value) {
-    return (value & (value - 1)) == 0;
+/* Get version number (e.g., 0x020000 for 2.0.0) */
+static inline unsigned int memento_version_number(void) {
+    return MEMENTO_VERSION;
 }
 
-MEMENTO_FORCE_INLINE void* memento_align_pointer(void* ptr, size_t alignment) {
-    uintptr_t addr = (uintptr_t)ptr;
-    uintptr_t aligned = memento_align_up(addr, alignment);
-    return (void*)aligned;
+/* Check if library version is at least major.minor.patch */
+static inline int memento_version_check(int major, int minor, int patch) {
+    return MEMENTO_VERSION >= ((major << 16) | (minor << 8) | patch);
 }
 
-/* Error string conversion */
-const char* memento_error_string(memento_error_t error) {
-    switch (error) {
-        case MEMENTO_SUCCESS: return "Success";
-        case MEMENTO_ERROR_INVALID_ARGUMENT: return "Invalid argument";
-        case MEMENTO_ERROR_OUT_OF_MEMORY: return "Out of memory";
-        case MEMENTO_ERROR_NOT_INITIALIZED: return "Not initialized";
-        case MEMENTO_ERROR_ALREADY_INITIALIZED: return "Already initialized";
-        case MEMENTO_ERROR_THREAD_NOT_INITIALIZED: return "Thread not initialized";
-        case MEMENTO_ERROR_ALLOCATION_FAILED: return "Allocation failed";
-        case MEMENTO_ERROR_INVALID_POINTER: return "Invalid pointer";
-        case MEMENTO_ERROR_UNSUPPORTED_OPERATION: return "Unsupported operation";
-        default: return "Unknown error";
-    }
-}
+/* ============================================================================
+ * Thread Heap API - Non-locking, thread-local caching
+ * ============================================================================ */
 
-/* Statistics functions */
-void memento_print_stats(const memento_allocator_t* allocator) {
-    if (!allocator) return;
-    
-    printf("=== Memento Allocator Statistics: %s ===\n", allocator->name);
-    printf("Total allocated:     %zu bytes\n", allocator->stats.total_allocated);
-    printf("Total deallocated:   %zu bytes\n", allocator->stats.total_deallocated);
-    printf("Current usage:       %zu bytes\n", allocator->stats.current_usage);
-    printf("Peak usage:          %zu bytes\n", allocator->stats.peak_usage);
-    printf("Allocation count:    %zu\n", allocator->stats.allocation_count);
-    printf("Deallocation count:  %zu\n", allocator->stats.deallocation_count);
-    printf("Failed allocations:  %zu\n", allocator->stats.failed_allocations);
-    printf("Thread cache hits:   %zu\n", allocator->stats.thread_cache_hits);
-    printf("Thread cache misses: %zu\n", allocator->stats.thread_cache_misses);
-    printf("Block allocations:   %zu\n", allocator->stats.block_allocations);
-    printf("Block deallocations: %zu\n", allocator->stats.block_deallocations);
-    printf("Memory leaks:        %zu bytes\n", 
-           allocator->stats.total_allocated - allocator->stats.total_deallocated);
-    printf("========================================\n");
-}
+/* Initialize global state (call once at startup) */
+bool memento_init(void);
+void memento_shutdown(void);
 
-const memento_stats_t* memento_get_stats(const memento_allocator_t* allocator) {
-    return allocator ? &allocator->stats : NULL;
-}
+/* Get thread-local heap (creates on first call, cached in TLS) */
+memento_thread_heap_t* memento_thread_heap_get(void);
 
-/* Core allocation functions */
-MEMENTO_FORCE_INLINE memento_result_t memento_alloc(memento_allocator_t* allocator, size_t size) {
-    return memento_alloc_aligned(allocator, size, MEMENTO_CHUNK_ALIGNMENT);
-}
+/* Allocate/free from thread-local heap (non-locking) */
+void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size);
+void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size);
+void* memento_thread_heap_realloc(memento_thread_heap_t* heap, void* ptr, 
+                                   size_t old_size, size_t new_size);
 
-MEMENTO_FORCE_INLINE memento_result_t memento_alloc_aligned(memento_allocator_t* allocator, size_t size, size_t alignment) {
-    memento_result_t result = {NULL, 0, false};
-    
-    if (!allocator || !allocator->allocate) {
-        return result;
-    }
-    
-    if (size == 0) {
-        result.success = true;
-        return result;
-    }
-    
-    /* Validate alignment */
-    if (!memento_is_power_of_two(alignment) || alignment > MEMENTO_MAX_ALIGNMENT) {
-        return result;
-    }
-    
-    result = allocator->allocate(allocator, size, alignment);
-    
-    if (result.success && result.ptr) {
-        allocator->stats.allocation_count++;
-        allocator->stats.total_allocated += result.size;
-        allocator->stats.current_usage += result.size;
-        
-        if (allocator->stats.current_usage > allocator->stats.peak_usage) {
-            allocator->stats.peak_usage = allocator->stats.current_usage;
-        }
-    } else {
-        allocator->stats.failed_allocations++;
-    }
-    
-    return result;
-}
+/* Flush any pending foreign deallocations (call periodically) */
+void memento_thread_heap_flush(memento_thread_heap_t* heap);
 
-MEMENTO_FORCE_INLINE void memento_free(memento_allocator_t* allocator, void* ptr) {
-    if (!allocator || !allocator->deallocate || !ptr) {
-        return;
-    }
-    
-    /* TODO: Track deallocation size for accurate statistics */
-    allocator->deallocate(allocator, ptr);
-    
-    allocator->stats.deallocation_count++;
-    /* Note: We can't easily track the size of freed memory without additional bookkeeping */
-}
+/* Get heap statistics */
+void memento_thread_heap_stats(memento_thread_heap_t* heap, memento_heap_stats_t* stats);
 
-/* ============================================================================= */
-/* THREAD CACHE ALLOCATOR (based on rpmalloc concepts)                        */
-/* ============================================================================= */
+/* ============================================================================
+ * Pool Allocator API - Fixed-size object pools
+ * ============================================================================ */
 
+/* Create pool for objects of given size */
+memento_pool_t* memento_pool_create(size_t object_size, size_t capacity, 
+                                     memento_thread_heap_t* heap);
+void memento_pool_destroy(memento_pool_t* pool);
+
+/* Allocate/free from pool */
+void* memento_pool_alloc(memento_pool_t* pool);
+void memento_pool_free(memento_pool_t* pool, void* ptr);
+
+/* ============================================================================
+ * Arena Allocator API - Bump allocator with power-of-2 growth
+ * ============================================================================ */
+
+/* Create arena with initial capacity */
+memento_arena_t* memento_arena_create(size_t initial_capacity,
+                                       memento_thread_heap_t* heap);
+void memento_arena_destroy(memento_arena_t* arena);
+
+/* Bump allocation */
+void* memento_arena_alloc(memento_arena_t* arena, size_t size, size_t alignment);
+
+/* Save/restore for temporary allocations */
 typedef struct {
-    memento_allocator_t base;
-    void* heap;  /* Thread-local heap data */
-    size_t cached_size;
-    void* cached_blocks;  /* Small block cache */
-} memento_thread_cache_t;
+    void* saved_top;
+    size_t saved_used;
+} memento_arena_save_t;
 
-/* Forward declarations for thread cache functions */
-static memento_result_t memento_thread_cache_allocate(memento_allocator_t* allocator, size_t size, size_t alignment);
-static void memento_thread_cache_deallocate(memento_allocator_t* allocator, void* ptr);
-static void memento_thread_cache_destroy(memento_allocator_t* allocator);
+memento_arena_save_t memento_arena_save(memento_arena_t* arena);
+void memento_arena_restore(memento_arena_t* arena, memento_arena_save_t* save);
 
-memento_allocator_t* memento_create_thread_cache(const char* name) {
-    size_t total_size = sizeof(memento_thread_cache_t) + strlen(name) + 1;
-    memento_thread_cache_t* cache = (memento_thread_cache_t*)malloc(total_size);
-    
-    if (!cache) {
-        return NULL;
-    }
-    
-    memset(cache, 0, sizeof(memento_thread_cache_t));
-    
-    /* Initialize base allocator */
-    cache->base.name = (const char*)(cache + 1);
-    strcpy((char*)cache->base.name, name ? name : "thread_cache");
-    memset(&cache->base.stats, 0, sizeof(memento_stats_t));
-    
-    cache->base.allocate = memento_thread_cache_allocate;
-    cache->base.deallocate = memento_thread_cache_deallocate;
-    cache->base.destroy = memento_thread_cache_destroy;
-    
-    /* Initialize thread cache specific data */
-    cache->heap = NULL;  /* Will be initialized on first use */
-    cache->cached_size = 0;
-    cache->cached_blocks = NULL;
-    
-    return &cache->base;
-}
+/* Reset arena to empty */
+void memento_arena_reset(memento_arena_t* arena);
 
-static memento_result_t memento_thread_cache_allocate(memento_allocator_t* allocator, size_t size, size_t alignment) {
-    memento_thread_cache_t* cache = (memento_thread_cache_t*)allocator;
-    memento_result_t result = {NULL, size, false};
-    
-    /* Simple malloc fallback for now - can be enhanced with actual thread caching */
-    void* ptr = NULL;
-    
-    if (alignment > MEMENTO_CHUNK_ALIGNMENT) {
-        /* Use aligned allocation */
-        #ifdef _WIN32
-            ptr = _aligned_malloc(size, alignment);
-        #else
-            if (posix_memalign(&ptr, alignment, size) != 0) {
-                ptr = NULL;
-            }
-        #endif
-    } else {
-        ptr = malloc(size);
-    }
-    
-    if (ptr) {
-        result.ptr = ptr;
-        result.success = true;
-        cache->base.stats.thread_cache_misses++;  /* Count as miss for now */
-    }
-    
-    return result;
-}
+/* Get stats */
+size_t memento_arena_used(const memento_arena_t* arena);
+size_t memento_arena_capacity(const memento_arena_t* arena);
 
-static void memento_thread_cache_deallocate(memento_allocator_t* allocator, void* ptr) {
-    memento_thread_cache_t* cache = (memento_thread_cache_t*)allocator;
-    
-    if (!ptr) return;
-    
-    /* Simple free for now - can be enhanced with actual thread caching */
-    #ifdef _WIN32
-        _aligned_free(ptr);
-    #else
-        free(ptr);
-    #endif
-    
-    cache->base.stats.thread_cache_hits++;  /* Count as hit for now */
-}
+/* ============================================================================
+ * Stack Allocator API - LIFO scope-based allocation
+ * ============================================================================ */
 
-static void memento_thread_cache_destroy(memento_allocator_t* allocator) {
-    memento_thread_cache_t* cache = (memento_thread_cache_t*)allocator;
-    
-    /* Clean up any cached blocks */
-    if (cache->cached_blocks) {
-        free(cache->cached_blocks);
-    }
-    
-    /* Clean up heap data */
-    if (cache->heap) {
-        free(cache->heap);
-    }
-    
-    free(cache);
-}
+/* Create stack with given capacity */
+memento_stack_t* memento_stack_create(size_t capacity, memento_thread_heap_t* heap);
+void memento_stack_destroy(memento_stack_t* stack);
 
-/* ============================================================================= */
-/* BLOCK ALLOCATOR (based on Wheel-of-Fortune concepts)                        */
-/* ============================================================================= */
+/* Push/pop allocations (LIFO - must free in reverse order) */
+void* memento_stack_push(memento_stack_t* stack, size_t size, size_t alignment);
+void memento_stack_pop(memento_stack_t* stack, void* ptr);
 
-typedef struct memento_block_chunk {
-    uint32_t prev;   /* bytes to previous chunk */
-    uint32_t last : 1;
-    uint32_t used : 1;
-    uint32_t jumbo : 1;
-    uint32_t len : 29;   /* chunk length including header */
-} memento_block_chunk_t;
+/* Frame markers for bulk rollback */
+typedef size_t memento_stack_marker_t;
 
-typedef struct memento_block_header {
-    struct memento_block_header* prev;
-    struct memento_block_header* next;
-} memento_block_header_t;
+memento_stack_marker_t memento_stack_marker(memento_stack_t* stack);
+void memento_stack_pop_to_marker(memento_stack_t* stack, memento_stack_marker_t marker);
 
-typedef struct {
-    memento_block_header_t* block_list;
-    memento_block_chunk_t* recycler[MEMENTO_RECYCLE_SLOTS];
-    int recycle_pos;
-    memento_allocator_t* backing;
-} memento_block_data_t;
+/* Reset entire stack */
+void memento_stack_reset(memento_stack_t* stack);
 
-typedef struct {
-    memento_allocator_t base;
-    memento_block_data_t data;
-} memento_block_allocator_t;
+/* ============================================================================
+ * Slab Allocator API - Multi-size object caching
+ * ============================================================================ */
 
-/* Forward declarations for block allocator functions */
-static memento_result_t memento_block_allocate(memento_allocator_t* allocator, size_t size, size_t alignment);
-static void memento_block_deallocate(memento_allocator_t* allocator, void* ptr);
-static void memento_block_destroy(memento_allocator_t* allocator);
+/* Create slab allocator */
+memento_slab_t* memento_slab_create(memento_thread_heap_t* heap);
+void memento_slab_destroy(memento_slab_t* slab);
 
-static void* memento_block_chunk_ptr(const memento_block_chunk_t* chunk) {
-    return (char*)chunk + sizeof(memento_block_chunk_t);
-}
+/* Allocate/free any size (automatically routed to appropriate size class) */
+void* memento_slab_alloc(memento_slab_t* slab, size_t size);
+void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size);
 
-static memento_block_chunk_t* memento_block_ptr_to_chunk(void* ptr) {
-    return (memento_block_chunk_t*)((char*)ptr - sizeof(memento_block_chunk_t));
-}
+/* ============================================================================
+ * Utility API
+ * ============================================================================ */
 
-static void memento_block_split(memento_block_chunk_t* chunk, uint32_t want_size) {
-    uint32_t remaining = chunk->len - want_size;
-    
-    if (remaining <= sizeof(memento_block_chunk_t)) {
-        return;  /* Not enough space to split */
-    }
-    
-    memento_block_chunk_t* next_chunk = (memento_block_chunk_t*)((char*)chunk + want_size);
-    next_chunk->len = remaining;
-    next_chunk->last = chunk->last;
-    next_chunk->used = 0;
-    next_chunk->prev = want_size;
-    
-    chunk->last = 0;
-    chunk->len = want_size;
-}
+/* Get size class for a given allocation size */
+size_t memento_size_class_for(size_t size);
+size_t memento_size_class_to_size(size_t sc);
 
-static void memento_block_merge_right(memento_block_data_t* data, memento_block_chunk_t* chunk) {
-    (void)data;  /* Unused parameter for now */
-    if (chunk->last) return;
-    
-    memento_block_chunk_t* next_chunk = (memento_block_chunk_t*)((char*)chunk + chunk->len);
-    if (next_chunk->used) return;
-    
-    chunk->len += next_chunk->len;
-    chunk->last = next_chunk->last;
-}
-
-memento_allocator_t* memento_create_block_allocator(const char* name, memento_allocator_t* backing) {
-    if (!backing) return NULL;
-    
-    size_t total_size = sizeof(memento_block_allocator_t) + strlen(name) + 1;
-    memento_block_allocator_t* block = (memento_block_allocator_t*)malloc(total_size);
-    
-    if (!block) {
-        return NULL;
-    }
-    
-    memset(block, 0, sizeof(memento_block_allocator_t));
-    
-    /* Initialize base allocator */
-    block->base.name = (const char*)(block + 1);
-    strcpy((char*)block->base.name, name ? name : "block");
-    memset(&block->base.stats, 0, sizeof(memento_stats_t));
-    
-    block->base.allocate = memento_block_allocate;
-    block->base.deallocate = memento_block_deallocate;
-    block->base.destroy = memento_block_destroy;
-    
-    /* Initialize block allocator data */
-    block->data.block_list = NULL;
-    block->data.recycle_pos = 0;
-    block->data.backing = backing;
-    
-    for (int i = 0; i < MEMENTO_RECYCLE_SLOTS; i++) {
-        block->data.recycler[i] = NULL;
-    }
-    
-    return &block->base;
-}
-
-static memento_result_t memento_block_allocate(memento_allocator_t* allocator, size_t size, size_t alignment) {
-    memento_block_allocator_t* block = (memento_block_allocator_t*)allocator;
-    memento_result_t result = {NULL, size, false};
-    
-    if (size == 0) {
-        result.success = true;
-        return result;
-    }
-    
-    /* Calculate total size needed: user data + alignment padding + metadata */
-    /* Always allocate extra space for alignment and original pointer storage */
-    size_t extra_space = sizeof(void*) + alignment;  /* space for original pointer + max alignment */
-    uint32_t need_size = (uint32_t)(size + sizeof(memento_block_chunk_t) + extra_space);
-    need_size = (need_size + MEMENTO_CHUNK_ALIGNMENT - 1) & ~(MEMENTO_CHUNK_ALIGNMENT - 1);
-    
-    /* Try recycler ring first */
-    for (int i = 0; i < MEMENTO_RECYCLE_SLOTS; i++) {
-        memento_block_chunk_t* chunk = block->data.recycler[block->data.recycle_pos];
-        if (chunk && chunk->len >= need_size) {
-            block->data.recycle_pos = (block->data.recycle_pos + 1) & (MEMENTO_RECYCLE_SLOTS - 1);
-            memento_block_split(chunk, need_size);
-            chunk->used = 1;
-            
-            result.ptr = memento_block_chunk_ptr(chunk);
-            result.success = true;
-            block->base.stats.block_allocations++;
-            return result;
-        }
-    }
-    
-    /* Allocate new block from backing allocator */
-    memento_block_header_t* block_header = (memento_block_header_t*)
-        memento_alloc(block->data.backing, MEMENTO_BLOCK_SIZE).ptr;
-    
-    if (!block_header) {
-        return result;
-    }
-    
-    block_header->prev = block_header->next = NULL;
-    
-    memento_block_chunk_t* chunk = (memento_block_chunk_t*)((char*)block_header + sizeof(memento_block_header_t));
-    chunk->len = MEMENTO_BLOCK_SIZE - sizeof(memento_block_header_t);
-    chunk->used = 0;
-    chunk->last = 1;
-    chunk->prev = 0;
-    
-    memento_block_split(chunk, need_size);
-    chunk->used = 1;
-    
-    /* Link block */
-    block_header->next = block->data.block_list;
-    if (block->data.block_list) {
-        block->data.block_list->prev = block_header;
-    }
-    block->data.block_list = block_header;
-    
-    void* raw_ptr = memento_block_chunk_ptr(chunk);
-    
-    /* Calculate the aligned pointer */
-    void* aligned_ptr = memento_align_pointer(raw_ptr, alignment);
-    
-    /* If we need to shift for alignment, store the original pointer */
-    if (aligned_ptr != raw_ptr) {
-        /* Store the original pointer right before the aligned pointer */
-        void** original_ptr_storage = (void**)((char*)aligned_ptr - sizeof(void*));
-        *original_ptr_storage = raw_ptr;
-    }
-    
-    result.ptr = aligned_ptr;
-    
-    result.success = true;
-    block->base.stats.block_allocations++;
-    
-    return result;
-}
-
-static void memento_block_deallocate(memento_allocator_t* allocator, void* ptr) {
-    memento_block_allocator_t* block = (memento_block_allocator_t*)allocator;
-    
-    if (!ptr) return;
-    
-    /* Recover the original pointer */
-    void* original_ptr = ptr;
-    
-    /* Check if this pointer was aligned by looking for a stored original pointer */
-    void** potential_original = (void**)((char*)ptr - sizeof(void*));
-    
-    /* Check if the value stored there points to a valid chunk (simple heuristic) */
-    void* candidate_original = *potential_original;
-    memento_block_chunk_t* candidate_chunk = memento_block_ptr_to_chunk(candidate_original);
-    
-    /* Verify this looks like a valid chunk by checking if it's within our blocks */
-    memento_block_header_t* header = block->data.block_list;
-    while (header) {
-        if ((char*)candidate_chunk >= (char*)header + sizeof(memento_block_header_t) &&
-            (char*)candidate_chunk < (char*)header + MEMENTO_BLOCK_SIZE) {
-            original_ptr = candidate_original;
-            break;
-        }
-        header = header->next;
-    }
-    
-    memento_block_chunk_t* chunk = memento_block_ptr_to_chunk(original_ptr);
-    chunk->used = 0;
-    
-    memento_block_merge_right(&block->data, chunk);
-    
-    /* Push to recycler ring */
-    block->data.recycler[block->data.recycle_pos] = chunk;
-    block->data.recycle_pos = (block->data.recycle_pos + 1) & (MEMENTO_RECYCLE_SLOTS - 1);
-    
-    block->base.stats.block_deallocations++;
-}
-
-static void memento_block_destroy(memento_allocator_t* allocator) {
-    memento_block_allocator_t* block = (memento_block_allocator_t*)allocator;
-    
-    /* Free all blocks */
-    memento_block_header_t* current = block->data.block_list;
-    while (current) {
-        memento_block_header_t* next = current->next;
-        memento_free(block->data.backing, current);
-        current = next;
-    }
-    
-    free(block);
-}
-
-/* ============================================================================= */
-/* PROXY ALLOCATOR (for tracking and debugging)                                */
-/* ============================================================================= */
-
-typedef struct {
-    memento_allocator_t base;
-    memento_allocator_t* backing;
-} memento_proxy_allocator_t;
-
-/* Forward declarations for proxy allocator functions */
-static memento_result_t memento_proxy_allocate(memento_allocator_t* allocator, size_t size, size_t alignment);
-static void memento_proxy_deallocate(memento_allocator_t* allocator, void* ptr);
-static void memento_proxy_destroy(memento_allocator_t* allocator);
-
-memento_allocator_t* memento_create_proxy_allocator(const char* name, memento_allocator_t* backing) {
-    if (!backing) return NULL;
-    
-    size_t total_size = sizeof(memento_proxy_allocator_t) + strlen(name) + 1;
-    memento_proxy_allocator_t* proxy = (memento_proxy_allocator_t*)malloc(total_size);
-    
-    if (!proxy) {
-        return NULL;
-    }
-    
-    memset(proxy, 0, sizeof(memento_proxy_allocator_t));
-    
-    /* Initialize base allocator */
-    proxy->base.name = (const char*)(proxy + 1);
-    strcpy((char*)proxy->base.name, name ? name : "proxy");
-    memset(&proxy->base.stats, 0, sizeof(memento_stats_t));
-    
-    proxy->base.allocate = memento_proxy_allocate;
-    proxy->base.deallocate = memento_proxy_deallocate;
-    proxy->base.destroy = memento_proxy_destroy;
-    
-    /* Initialize proxy data */
-    proxy->backing = backing;
-    
-    return &proxy->base;
-}
-
-static memento_result_t memento_proxy_allocate(memento_allocator_t* allocator, size_t size, size_t alignment) {
-    memento_proxy_allocator_t* proxy = (memento_proxy_allocator_t*)allocator;
-    
-    /* Add debug tracking here if needed */
-    #if MEMENTO_ENABLE_DEBUG_CHECKS
-        printf("[PROXY] Allocating %zu bytes with alignment %zu from %s\n", size, alignment, proxy->base.name);
-    #endif
-    
-    memento_result_t result = proxy->backing->allocate(proxy->backing, size, alignment);
-    
-    if (result.success) {
-        /* Update proxy statistics */
-        proxy->base.stats.allocation_count++;
-        proxy->base.stats.total_allocated += result.size;
-        proxy->base.stats.current_usage += result.size;
-        
-        if (proxy->base.stats.current_usage > proxy->base.stats.peak_usage) {
-            proxy->base.stats.peak_usage = proxy->base.stats.current_usage;
-        }
-        
-        /* Also update backing allocator statistics */
-        proxy->backing->stats.allocation_count++;
-        proxy->backing->stats.total_allocated += result.size;
-        proxy->backing->stats.current_usage += result.size;
-        
-        if (proxy->backing->stats.current_usage > proxy->backing->stats.peak_usage) {
-            proxy->backing->stats.peak_usage = proxy->backing->stats.current_usage;
-        }
-    }
-    
-    return result;
-}
-
-static void memento_proxy_deallocate(memento_allocator_t* allocator, void* ptr) {
-    memento_proxy_allocator_t* proxy = (memento_proxy_allocator_t*)allocator;
-    
-    if (!ptr) return;
-    
-    /* Add debug tracking here if needed */
-    #if MEMENTO_ENABLE_DEBUG_CHECKS
-        printf("[PROXY] Deallocating pointer %p from %s\n", ptr, proxy->base.name);
-    #endif
-    
-    proxy->backing->deallocate(proxy->backing, ptr);
-    
-    /* Update proxy statistics */
-    proxy->base.stats.deallocation_count++;
-    
-    /* Also update backing allocator statistics */
-    proxy->backing->stats.deallocation_count++;
-    /* Note: Cannot easily track size of freed memory */
-}
-
-static void memento_proxy_destroy(memento_allocator_t* allocator) {
-    memento_proxy_allocator_t* proxy = (memento_proxy_allocator_t*)allocator;
-    
-    /* Print final statistics if enabled */
-    #if MEMENTO_ENABLE_STATISTICS
-        if (proxy->base.stats.allocation_count > 0 || proxy->base.stats.deallocation_count > 0) {
-            memento_print_stats(allocator);
-        }
-    #endif
-    
-    free(proxy);
-}
-
-/* ============================================================================= */
-/* STACK ALLOCATOR (for temporary allocations)                                 */
-/* ============================================================================= */
-
-typedef struct {
-    memento_allocator_t base;
-    char* start;
-    char* end;
-    char* top;
-    memento_allocator_t* backing;
-} memento_stack_allocator_t;
-
-/* Forward declarations for stack allocator functions */
-static memento_result_t memento_stack_allocate(memento_allocator_t* allocator, size_t size, size_t alignment);
-static void memento_stack_deallocate(memento_allocator_t* allocator, void* ptr);
-static void memento_stack_destroy(memento_allocator_t* allocator);
-
-memento_allocator_t* memento_create_stack_allocator(const char* name, size_t capacity, memento_allocator_t* backing) {
-    if (!backing || capacity == 0) return NULL;
-    
-    /* Validate capacity to prevent overflow */
-    if (capacity > SIZE_MAX / 2) return NULL;
-    
-    size_t total_size = sizeof(memento_stack_allocator_t) + strlen(name) + 1;
-    memento_stack_allocator_t* stack = (memento_stack_allocator_t*)malloc(total_size);
-    
-    if (!stack) {
-        return NULL;
-    }
-    
-    memset(stack, 0, sizeof(memento_stack_allocator_t));
-    
-    /* Allocate stack memory from backing allocator */
-    memento_result_t mem_result = memento_alloc_aligned(backing, capacity, MEMENTO_CACHE_LINE_SIZE);
-    if (!mem_result.success) {
-        free(stack);
-        return NULL;
-    }
-    
-    /* Initialize base allocator */
-    stack->base.name = (const char*)(stack + 1);
-    strcpy((char*)stack->base.name, name ? name : "stack");
-    memset(&stack->base.stats, 0, sizeof(memento_stats_t));
-    
-    stack->base.allocate = memento_stack_allocate;
-    stack->base.deallocate = memento_stack_deallocate;
-    stack->base.destroy = memento_stack_destroy;
-    
-    /* Initialize stack data */
-    stack->start = (char*)mem_result.ptr;
-    stack->end = stack->start + capacity;
-    stack->top = stack->start;
-    stack->backing = backing;
-    
-    return &stack->base;
-}
-
-static memento_result_t memento_stack_allocate(memento_allocator_t* allocator, size_t size, size_t alignment) {
-    memento_stack_allocator_t* stack = (memento_stack_allocator_t*)allocator;
-    memento_result_t result = {NULL, size, false};
-    
-    if (size == 0) {
-        result.success = true;
-        return result;
-    }
-    
-    /* Align the top pointer */
-    char* aligned_top = (char*)memento_align_pointer(stack->top, alignment);
-    
-    /* Check if we have enough space */
-    if (aligned_top + size > stack->end) {
-        return result;  /* Out of stack space */
-    }
-    
-    result.ptr = aligned_top;
-    result.success = true;
-    stack->top = aligned_top + size;
-    
-    return result;
-}
-
-static void memento_stack_deallocate(memento_allocator_t* allocator, void* ptr) {
-    /* Stack allocator doesn't support individual deallocations */
-    /* This is intentional - use reset to clear the entire stack */
-    (void)allocator;
-    (void)ptr;
-}
-
-static void memento_stack_destroy(memento_allocator_t* allocator) {
-    memento_stack_allocator_t* stack = (memento_stack_allocator_t*)allocator;
-    
-    /* Free the stack memory */
-    if (stack->start) {
-        memento_free(stack->backing, stack->start);
-    }
-    
-    free(stack);
-}
-
-/* ============================================================================= */
-/* GLOBAL MANAGEMENT FUNCTIONS                                                 */
-/* ============================================================================= */
-
-static int initialize_thread_cache(void) {
-    /* Initialize thread-local storage for thread cache */
-    /* This is a simplified implementation */
-    return MEMENTO_SUCCESS;
-}
-
-static void shutdown_thread_cache(void) {
-    /* Clean up thread-local storage */
-}
-
-int memento_init(void) {
-    if (g_memento.initialized) {
-        return MEMENTO_ERROR_ALREADY_INITIALIZED;
-    }
-    
-    /* Initialize configuration with defaults */
-    g_memento.config.enable_statistics = MEMENTO_ENABLE_STATISTICS;
-    g_memento.config.enable_debug_checks = MEMENTO_ENABLE_DEBUG_CHECKS;
-    g_memento.config.enable_thread_cache = true;
-    g_memento.config.enable_block_allocator = true;
-    g_memento.config.thread_cache_size = 64 * 1024;  /* 64KB */
-    g_memento.config.thread_cache_threshold = 1024;  /* 1KB */
-    g_memento.config.block_size = MEMENTO_BLOCK_SIZE;
-    g_memento.config.min_chunk_size = MEMENTO_MIN_CHUNK_SIZE;
-    g_memento.config.max_chunk_size = MEMENTO_BLOCK_SIZE / 4;
-    g_memento.config.memory_map_threshold = 2 * 1024 * 1024;  /* 2MB */
-    g_memento.config.page_size = 4096;  /* 4KB */
-    
-    /* Initialize thread cache system */
-    int result = initialize_thread_cache();
-    if (result != MEMENTO_SUCCESS) {
-        return result;
-    }
-    
-    /* Create root allocator */
-    g_memento.root_allocator = memento_create_thread_cache("root");
-    if (!g_memento.root_allocator) {
-        shutdown_thread_cache();
-        return MEMENTO_ERROR_OUT_OF_MEMORY;
-    }
-    
-    g_memento.initialized = true;
-    return MEMENTO_SUCCESS;
-}
-
-int memento_shutdown(void) {
-    if (!g_memento.initialized) {
-        return MEMENTO_ERROR_NOT_INITIALIZED;
-    }
-    
-    /* Destroy root allocator */
-    if (g_memento.root_allocator) {
-        memento_destroy_allocator(g_memento.root_allocator);
-        g_memento.root_allocator = NULL;
-    }
-    
-    /* Shutdown thread cache system */
-    shutdown_thread_cache();
-    
-    g_memento.initialized = false;
-    return MEMENTO_SUCCESS;
-}
-
-bool memento_is_initialized(void) {
-    return g_memento.initialized;
-}
-
-const memento_config_t* memento_get_config(void) {
-    return &g_memento.config;
-}
-
-void memento_destroy_allocator(memento_allocator_t* allocator) {
-    if (!allocator) return;
-    
-    if (allocator->destroy) {
-        allocator->destroy(allocator);
-    } else {
-        free(allocator);
-    }
-}
-
-#endif /* MEMENTO_IMPLEMENTATION */
+/* Alignment utilities */
+bool memento_is_power_of_two(size_t x);
+size_t memento_align_up(size_t size, size_t alignment);
+size_t memento_align_down(size_t size, size_t alignment);
 
 #ifdef __cplusplus
 }
 #endif
+
+/* ============================================================================
+ * Implementation Section
+ * 
+ * Include this in exactly ONE source file:
+ *   #define MEMENTO_IMPLEMENTATION
+ *   #include "memento.h"
+ * ============================================================================ */
+
+#ifdef MEMENTO_IMPLEMENTATION
+
+/* ============================================================================
+ * Internal Implementation - Non-locking Design
+ * ============================================================================ */
+
+/* Internal headers */
+#include <sys/mman.h>
+#include <unistd.h>
+#include <pthread.h>
+
+/* MAP_ANONYMOUS compatibility */
+#ifndef MAP_ANONYMOUS
+    #ifdef MAP_ANON
+        #define MAP_ANONYMOUS MAP_ANON
+    #else
+        #define MAP_ANONYMOUS 0x20  /* Common value */
+    #endif
+#endif
+
+/* Branch prediction hints */
+#ifndef MEMENTO_LIKELY
+    #define MEMENTO_LIKELY(x) __builtin_expect(!!(x), 1)
+#endif
+#ifndef MEMENTO_UNLIKELY
+    #define MEMENTO_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#endif
+
+/* Fallback macros for allocation */
+#ifndef MEMENTO_MALLOC
+    #define MEMENTO_MALLOC(size) malloc(size)
+#endif
+#ifndef MEMENTO_FREE
+    #define MEMENTO_FREE(ptr, size) free(ptr)
+#endif
+#ifndef MEMENTO_MMAP
+    #define MEMENTO_MMAP(size) mmap(NULL, size, PROT_READ|PROT_WRITE, \
+        MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+#endif
+#ifndef MEMENTO_MUNMAP
+    #define MEMENTO_MUNMAP(ptr, size) munmap(ptr, size)
+#endif
+
+/* Size class configuration */
+static const size_t memento_size_classes[MEMENTO_SIZE_CLASS_COUNT] = {
+    32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192
+};
+
+MEMENTO_FORCE_INLINE size_t memento_size_class_for(size_t size) {
+    if (size <= 32) return 0;
+    if (size <= 64) return 1;
+    if (size <= 96) return 2;
+    if (size <= 128) return 3;
+    if (size <= 192) return 4;
+    if (size <= 256) return 5;
+    if (size <= 384) return 6;
+    if (size <= 512) return 7;
+    if (size <= 768) return 8;
+    if (size <= 1024) return 9;
+    if (size <= 1536) return 10;
+    if (size <= 2048) return 11;
+    if (size <= 3072) return 12;
+    if (size <= 4096) return 13;
+    if (size <= 6144) return 14;
+    return 15;
+}
+
+MEMENTO_FORCE_INLINE size_t memento_size_class_to_size(size_t sc) {
+    return (sc < MEMENTO_SIZE_CLASS_COUNT) ? memento_size_classes[sc] : 8192;
+}
+
+MEMENTO_FORCE_INLINE bool memento_is_power_of_two(size_t x) {
+    return (x & (x - 1)) == 0;
+}
+
+MEMENTO_FORCE_INLINE size_t memento_align_up(size_t size, size_t alignment) {
+    return (size + alignment - 1) & ~(alignment - 1);
+}
+
+MEMENTO_FORCE_INLINE size_t memento_align_down(size_t size, size_t alignment) {
+    return size & ~(alignment - 1);
+}
+
+/* ============================================================================
+ * Internal Thread Cache - Non-locking Treiber Stack
+ * ============================================================================ */
+
+typedef struct memento_cache_node_s {
+    struct memento_cache_node_s* next;
+} memento_cache_node_t;
+
+typedef struct {
+    memento_cache_node_t* head;
+    uint32_t count;
+    uint32_t limit;
+} memento_size_class_cache_t;
+
+/* Thread-local heap structure */
+struct memento_thread_heap_s {
+    /* Size class caches - purely thread-local, no atomics needed */
+    memento_size_class_cache_t caches[MEMENTO_SIZE_CLASS_COUNT];
+    
+    /* Foreign deallocation ring buffer (SPSC - single producer, single consumer) */
+    void* foreign_buffer[256];
+    uint32_t foreign_head;  /* Only this thread writes */
+    uint32_t foreign_tail;  /* Other threads write */
+    char foreign_pad[MEMENTO_CACHE_LINE_SIZE - 8]; /* Pad to cache line */
+    
+    /* Statistics (relaxed consistency - just for monitoring) */
+    memento_heap_stats_t stats;
+    
+    /* Thread ID for debugging */
+    uint64_t thread_id;
+    
+    /* Heap state */
+    uint8_t initialized;
+    uint8_t _pad[7];
+};
+
+/* ============================================================================
+ * Thread-local Storage
+ * ============================================================================ */
+
+static MEMENTO_TLS memento_thread_heap_t* memento_tls_heap = NULL;
+
+static uint64_t memento_get_thread_id(void) {
+#if defined(__linux__)
+    return (uint64_t)pthread_self();
+#elif defined(_WIN32)
+    return (uint64_t)GetCurrentThreadId();
+#else
+    static uint64_t counter = 0;
+    return ++counter;
+#endif
+}
+
+static void memento_heap_init(memento_thread_heap_t* heap) {
+    memset(heap, 0, sizeof(memento_thread_heap_t));
+    
+    for (int i = 0; i < MEMENTO_SIZE_CLASS_COUNT; i++) {
+        heap->caches[i].limit = 64; /* Max 64 items per size class */
+    }
+    
+    heap->thread_id = memento_get_thread_id();
+    heap->initialized = 1;
+}
+
+/* Get or create thread-local heap */
+memento_thread_heap_t* memento_thread_heap_get(void) {
+    if (MEMENTO_UNLIKELY(memento_tls_heap == NULL)) {
+        memento_tls_heap = (memento_thread_heap_t*)MEMENTO_MALLOC(sizeof(memento_thread_heap_t));
+        if (memento_tls_heap) {
+            memento_heap_init(memento_tls_heap);
+        }
+    }
+    return memento_tls_heap;
+}
+
+/* ============================================================================
+ * Cache Operations - Non-locking
+ * ============================================================================ */
+
+static MEMENTO_FORCE_INLINE void* memento_cache_pop(memento_size_class_cache_t* cache) {
+    memento_cache_node_t* node = cache->head;
+    if (MEMENTO_LIKELY(node != NULL)) {
+        cache->head = node->next;
+        cache->count--;
+        return node;
+    }
+    return NULL;
+}
+
+static MEMENTO_FORCE_INLINE bool memento_cache_push(memento_size_class_cache_t* cache, void* ptr) {
+    if (cache->count >= cache->limit) {
+        return false; /* Cache full */
+    }
+    memento_cache_node_t* node = (memento_cache_node_t*)ptr;
+    node->next = cache->head;
+    cache->head = node;
+    cache->count++;
+    return true;
+}
+
+/* ============================================================================
+ * Foreign Deallocation - SPSC Ring Buffer (non-locking)
+ * ============================================================================ */
+
+#define MEMENTO_FOREIGN_RING_SIZE 256
+#define MEMENTO_FOREIGN_MASK (MEMENTO_FOREIGN_RING_SIZE - 1)
+
+static bool memento_foreign_push(memento_thread_heap_t* heap, void* ptr) {
+    uint32_t head = heap->foreign_head;
+    uint32_t next = (head + 1) & MEMENTO_FOREIGN_MASK;
+    
+    if (next == heap->foreign_tail) {
+        return false; /* Ring full */
+    }
+    
+    heap->foreign_buffer[head] = ptr;
+    heap->foreign_head = next;
+    return true;
+}
+
+static void* memento_foreign_pop(memento_thread_heap_t* heap) {
+    if (heap->foreign_head == heap->foreign_tail) {
+        return NULL; /* Ring empty */
+    }
+    
+    void* ptr = heap->foreign_buffer[heap->foreign_tail];
+    heap->foreign_tail = (heap->foreign_tail + 1) & MEMENTO_FOREIGN_MASK;
+    return ptr;
+}
+
+void memento_thread_heap_flush(memento_thread_heap_t* heap) {
+    void* ptr;
+    while ((ptr = memento_foreign_pop(heap)) != NULL) {
+        /* Size is stored in the first 8 bytes of the allocation */
+        size_t size = *(size_t*)ptr;
+        memento_thread_heap_free(heap, (char*)ptr + 8, size);
+        heap->stats.foreign_free_count++;
+    }
+}
+
+/* ============================================================================
+ * Allocation from System
+ * ============================================================================ */
+
+static void* memento_alloc_from_system(size_t size) {
+    /* Use mmap for large allocations, malloc for small */
+    if (size >= 64 * 1024) {
+        size = memento_align_up(size, 4096);
+        return MEMENTO_MMAP(size);
+    }
+    return MEMENTO_MALLOC(size);
+}
+
+static void memento_free_to_system(void* ptr, size_t size) {
+    if (size >= 64 * 1024) {
+        size = memento_align_up(size, 4096);
+        MEMENTO_MUNMAP(ptr, size);
+    } else {
+        MEMENTO_FREE(ptr, size);
+    }
+}
+
+/* ============================================================================
+ * Thread Heap Allocation
+ * ============================================================================ */
+
+void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size) {
+    if (MEMENTO_UNLIKELY(heap == NULL || size == 0)) {
+        return NULL;
+    }
+    
+    /* Check for size classes */
+    if (size <= 8192) {
+        size_t sc = memento_size_class_for(size);
+        size_t actual_size = memento_size_class_to_size(sc);
+        
+        /* Try thread-local cache first */
+        void* ptr = memento_cache_pop(&heap->caches[sc]);
+        if (MEMENTO_LIKELY(ptr != NULL)) {
+            heap->stats.alloc_count++;
+            return ptr;
+        }
+        
+        /* Allocate from system */
+        ptr = memento_alloc_from_system(actual_size);
+        if (ptr) {
+            heap->stats.alloc_count++;
+            heap->stats.bytes_allocated += actual_size;
+        }
+        return ptr;
+    }
+    
+    /* Large allocation - direct from system with size header for foreign free */
+    size_t total_size = size + sizeof(size_t);
+    void* ptr = memento_alloc_from_system(total_size);
+    if (ptr) {
+        *(size_t*)ptr = size;
+        heap->stats.alloc_count++;
+        heap->stats.bytes_allocated += size;
+        return (char*)ptr + sizeof(size_t);
+    }
+    return NULL;
+}
+
+void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size) {
+    if (MEMENTO_UNLIKELY(ptr == NULL || heap == NULL)) {
+        return;
+    }
+    
+    /* For large allocations, adjust pointer and size to include header */
+    void* original_ptr = ptr;
+    size_t total_size = size;
+    if (size > 8192) {
+        original_ptr = (char*)ptr - sizeof(size_t);
+        total_size = size + sizeof(size_t);
+    }
+    
+    /* Check if this is a foreign free (different thread) */
+    if (memento_get_thread_id() != heap->thread_id) {
+        /* Push to foreign ring buffer (use original_ptr with header) */
+        if (memento_foreign_push(heap, original_ptr)) {
+            return;
+        }
+        /* Ring full - flush and retry */
+        memento_thread_heap_flush(heap);
+        memento_foreign_push(heap, original_ptr);
+        return;
+    }
+    
+    /* Local free - try to cache it */
+    if (size <= 8192) {
+        size_t sc = memento_size_class_for(size);
+        if (memento_cache_push(&heap->caches[sc], ptr)) {
+            heap->stats.free_count++;
+            return;
+        }
+    }
+    
+    /* Return to system (use original_ptr and total_size for large allocs) */
+    memento_free_to_system(original_ptr, total_size);
+    heap->stats.free_count++;
+    heap->stats.bytes_freed += size;
+}
+
+void* memento_thread_heap_realloc(memento_thread_heap_t* heap, void* ptr,
+                                   size_t old_size, size_t new_size) {
+    if (ptr == NULL) {
+        return memento_thread_heap_alloc(heap, new_size);
+    }
+    if (new_size == 0) {
+        memento_thread_heap_free(heap, ptr, old_size);
+        return NULL;
+    }
+    
+    void* new_ptr = memento_thread_heap_alloc(heap, new_size);
+    if (new_ptr) {
+        size_t copy_size = (old_size < new_size) ? old_size : new_size;
+        memcpy(new_ptr, ptr, copy_size);
+        memento_thread_heap_free(heap, ptr, old_size);
+    }
+    return new_ptr;
+}
+
+void memento_thread_heap_stats(memento_thread_heap_t* heap, memento_heap_stats_t* stats) {
+    if (heap && stats) {
+        *stats = heap->stats;
+    }
+}
+
+/* ============================================================================
+ * Global Initialization
+ * ============================================================================ */
+
+static bool memento_initialized = false;
+
+bool memento_init(void) {
+    if (memento_initialized) {
+        return true;
+    }
+    memento_initialized = true;
+    return true;
+}
+
+void memento_shutdown(void) {
+    /* Thread heaps are cleaned up when threads exit via TLS destructor */
+    memento_initialized = false;
+}
+
+/* ============================================================================
+ * Pool Allocator Implementation
+ * ============================================================================ */
+
+typedef struct memento_pool_chunk_s {
+    struct memento_pool_chunk_s* next;
+} memento_pool_chunk_t;
+
+struct memento_pool_s {
+    memento_pool_chunk_t* free_list;
+    size_t object_size;
+    size_t capacity;
+    size_t count;
+    memento_thread_heap_t* heap;
+    void* blocks;  /* Linked list of allocated blocks for cleanup */
+};
+
+memento_pool_t* memento_pool_create(size_t object_size, size_t capacity,
+                                     memento_thread_heap_t* heap) {
+    if (object_size < sizeof(void*)) {
+        object_size = sizeof(void*);
+    }
+    
+    memento_pool_t* pool = (memento_pool_t*)MEMENTO_MALLOC(sizeof(memento_pool_t));
+    if (!pool) return NULL;
+    
+    pool->object_size = object_size;
+    pool->capacity = capacity;
+    pool->count = 0;
+    pool->heap = heap ? heap : memento_thread_heap_get();
+    pool->free_list = NULL;
+    pool->blocks = NULL;
+    
+    /* Pre-allocate objects */
+    size_t block_size = object_size * capacity;
+    void* block = memento_thread_heap_alloc(pool->heap, block_size);
+    if (!block) {
+        MEMENTO_FREE(pool, sizeof(memento_pool_t));
+        return NULL;
+    }
+    
+    /* Build free list */
+    for (size_t i = 0; i < capacity; i++) {
+        memento_pool_chunk_t* chunk = (memento_pool_chunk_t*)((char*)block + i * object_size);
+        chunk->next = pool->free_list;
+        pool->free_list = chunk;
+    }
+    
+    return pool;
+}
+
+void memento_pool_destroy(memento_pool_t* pool) {
+    if (!pool) return;
+    /* TODO: Free blocks */
+    MEMENTO_FREE(pool, sizeof(memento_pool_t));
+}
+
+void* memento_pool_alloc(memento_pool_t* pool) {
+    if (!pool || !pool->free_list) return NULL;
+    
+    memento_pool_chunk_t* chunk = pool->free_list;
+    pool->free_list = chunk->next;
+    pool->count--;
+    return chunk;
+}
+
+void memento_pool_free(memento_pool_t* pool, void* ptr) {
+    if (!pool || !ptr) return;
+    
+    memento_pool_chunk_t* chunk = (memento_pool_chunk_t*)ptr;
+    chunk->next = pool->free_list;
+    pool->free_list = chunk;
+    pool->count++;
+}
+
+/* ============================================================================
+ * Arena Allocator Implementation
+ * ============================================================================ */
+
+typedef struct memento_arena_block_s {
+    struct memento_arena_block_s* next;
+    size_t size;
+    char data[];
+} memento_arena_block_t;
+
+struct memento_arena_s {
+    memento_arena_block_t* current;
+    memento_arena_block_t* blocks;
+    void* top;
+    size_t used;
+    size_t capacity;
+    size_t initial_capacity;
+    memento_thread_heap_t* heap;
+};
+
+memento_arena_t* memento_arena_create(size_t initial_capacity,
+                                       memento_thread_heap_t* heap) {
+    memento_arena_t* arena = (memento_arena_t*)MEMENTO_MALLOC(sizeof(memento_arena_t));
+    if (!arena) return NULL;
+    
+    arena->heap = heap ? heap : memento_thread_heap_get();
+    arena->initial_capacity = initial_capacity;
+    arena->capacity = initial_capacity;
+    arena->used = 0;
+    
+    /* Allocate initial block */
+    size_t block_size = sizeof(memento_arena_block_t) + initial_capacity;
+    arena->current = (memento_arena_block_t*)memento_thread_heap_alloc(arena->heap, block_size);
+    if (!arena->current) {
+        MEMENTO_FREE(arena, sizeof(memento_arena_t));
+        return NULL;
+    }
+    
+    arena->current->next = NULL;
+    arena->current->size = initial_capacity;
+    arena->blocks = arena->current;
+    arena->top = arena->current->data;
+    
+    return arena;
+}
+
+void memento_arena_destroy(memento_arena_t* arena) {
+    if (!arena) return;
+    
+    memento_arena_block_t* block = arena->blocks;
+    while (block) {
+        memento_arena_block_t* next = block->next;
+        memento_thread_heap_free(arena->heap, block, sizeof(memento_arena_block_t) + block->size);
+        block = next;
+    }
+    
+    MEMENTO_FREE(arena, sizeof(memento_arena_t));
+}
+
+void* memento_arena_alloc(memento_arena_t* arena, size_t size, size_t alignment) {
+    if (!arena || size == 0) return NULL;
+    
+    /* Align the current position */
+    uintptr_t current = (uintptr_t)arena->top;
+    uintptr_t aligned = (current + alignment - 1) & ~(alignment - 1);
+    size_t padding = aligned - current;
+    
+    /* Check if we need to grow */
+    if (arena->used + padding + size > arena->capacity) {
+        /* Grow with power of 2 */
+        size_t new_capacity = arena->capacity * 2;
+        while (new_capacity < size + sizeof(memento_arena_block_t)) {
+            new_capacity *= 2;
+        }
+        
+        size_t block_size = sizeof(memento_arena_block_t) + new_capacity;
+        memento_arena_block_t* block = (memento_arena_block_t*)memento_thread_heap_alloc(arena->heap, block_size);
+        if (!block) return NULL;
+        
+        block->next = arena->blocks;
+        block->size = new_capacity;
+        arena->blocks = block;
+        arena->current = block;
+        arena->capacity = new_capacity;
+        arena->used = 0;
+        arena->top = block->data;
+        
+        /* Recalculate alignment */
+        current = (uintptr_t)arena->top;
+        aligned = (current + alignment - 1) & ~(alignment - 1);
+    }
+    
+    void* ptr = (void*)aligned;
+    arena->top = (char*)aligned + size;
+    arena->used += padding + size;
+    
+    return ptr;
+}
+
+memento_arena_save_t memento_arena_save(memento_arena_t* arena) {
+    memento_arena_save_t save;
+    save.saved_top = arena->top;
+    save.saved_used = arena->used;
+    return save;
+}
+
+void memento_arena_restore(memento_arena_t* arena, memento_arena_save_t* save) {
+    if (!arena || !save) return;
+    arena->top = save->saved_top;
+    arena->used = save->saved_used;
+}
+
+void memento_arena_reset(memento_arena_t* arena) {
+    if (!arena) return;
+    arena->top = arena->current->data;
+    arena->used = 0;
+}
+
+size_t memento_arena_used(const memento_arena_t* arena) {
+    return arena ? arena->used : 0;
+}
+
+size_t memento_arena_capacity(const memento_arena_t* arena) {
+    return arena ? arena->capacity : 0;
+}
+
+/* ============================================================================
+ * Stack Allocator Implementation
+ * ============================================================================ */
+
+struct memento_stack_s {
+    char* buffer;
+    size_t capacity;
+    size_t top;
+    memento_thread_heap_t* heap;
+};
+
+memento_stack_t* memento_stack_create(size_t capacity, memento_thread_heap_t* heap) {
+    memento_stack_t* stack = (memento_stack_t*)MEMENTO_MALLOC(sizeof(memento_stack_t));
+    if (!stack) return NULL;
+    
+    stack->heap = heap ? heap : memento_thread_heap_get();
+    stack->buffer = (char*)memento_thread_heap_alloc(stack->heap, capacity);
+    if (!stack->buffer) {
+        MEMENTO_FREE(stack, sizeof(memento_stack_t));
+        return NULL;
+    }
+    
+    stack->capacity = capacity;
+    stack->top = 0;
+    return stack;
+}
+
+void memento_stack_destroy(memento_stack_t* stack) {
+    if (!stack) return;
+    if (stack->buffer) {
+        memento_thread_heap_free(stack->heap, stack->buffer, stack->capacity);
+    }
+    MEMENTO_FREE(stack, sizeof(memento_stack_t));
+}
+
+void* memento_stack_push(memento_stack_t* stack, size_t size, size_t alignment) {
+    if (!stack) return NULL;
+    
+    size_t aligned_top = memento_align_up(stack->top, alignment);
+    if (aligned_top + size > stack->capacity) {
+        return NULL; /* Stack overflow */
+    }
+    
+    void* ptr = stack->buffer + aligned_top;
+    stack->top = aligned_top + size;
+    return ptr;
+}
+
+void memento_stack_pop(memento_stack_t* stack, void* ptr) {
+    if (!stack || !ptr) return;
+    /* In a real implementation, we'd track sizes to validate LIFO order */
+    /* For now, this is a no-op - the memory is just reused on next push */
+    (void)ptr;
+}
+
+memento_stack_marker_t memento_stack_marker(memento_stack_t* stack) {
+    return stack ? stack->top : 0;
+}
+
+void memento_stack_pop_to_marker(memento_stack_t* stack, memento_stack_marker_t marker) {
+    if (stack) {
+        stack->top = marker;
+    }
+}
+
+void memento_stack_reset(memento_stack_t* stack) {
+    if (stack) {
+        stack->top = 0;
+    }
+}
+
+/* ============================================================================
+ * Slab Allocator Implementation
+ * ============================================================================ */
+
+typedef struct {
+    memento_size_class_cache_t cache;
+    size_t block_size;
+} memento_slab_class_t;
+
+struct memento_slab_s {
+    memento_slab_class_t classes[MEMENTO_SIZE_CLASS_COUNT];
+    memento_thread_heap_t* heap;
+};
+
+memento_slab_t* memento_slab_create(memento_thread_heap_t* heap) {
+    memento_slab_t* slab = (memento_slab_t*)MEMENTO_MALLOC(sizeof(memento_slab_t));
+    if (!slab) return NULL;
+    
+    slab->heap = heap ? heap : memento_thread_heap_get();
+    
+    for (int i = 0; i < MEMENTO_SIZE_CLASS_COUNT; i++) {
+        slab->classes[i].cache.head = NULL;
+        slab->classes[i].cache.count = 0;
+        slab->classes[i].cache.limit = 64;
+        slab->classes[i].block_size = memento_size_class_to_size(i);
+    }
+    
+    return slab;
+}
+
+void memento_slab_destroy(memento_slab_t* slab) {
+    if (!slab) return;
+    /* Free all cached blocks */
+    for (int i = 0; i < MEMENTO_SIZE_CLASS_COUNT; i++) {
+        void* ptr;
+        while ((ptr = memento_cache_pop(&slab->classes[i].cache)) != NULL) {
+            memento_thread_heap_free(slab->heap, ptr, slab->classes[i].block_size);
+        }
+    }
+    MEMENTO_FREE(slab, sizeof(memento_slab_t));
+}
+
+void* memento_slab_alloc(memento_slab_t* slab, size_t size) {
+    if (!slab || size == 0) return NULL;
+    
+    if (size > 8192) {
+        /* Large allocation - bypass slab */
+        return memento_thread_heap_alloc(slab->heap, size);
+    }
+    
+    size_t sc = memento_size_class_for(size);
+    void* ptr = memento_cache_pop(&slab->classes[sc].cache);
+    if (!ptr) {
+        ptr = memento_thread_heap_alloc(slab->heap, slab->classes[sc].block_size);
+    }
+    return ptr;
+}
+
+void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size) {
+    if (!slab || !ptr) return;
+    
+    if (size > 8192) {
+        memento_thread_heap_free(slab->heap, ptr, size);
+        return;
+    }
+    
+    size_t sc = memento_size_class_for(size);
+    if (!memento_cache_push(&slab->classes[sc].cache, ptr)) {
+        memento_thread_heap_free(slab->heap, ptr, slab->classes[sc].block_size);
+    }
+}
+
+#endif /* MEMENTO_IMPLEMENTATION */
 
 #endif /* MEMENTO_H */

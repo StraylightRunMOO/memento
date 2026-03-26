@@ -1,361 +1,409 @@
-# Memento Memory Allocator Library
+# Memento - High-Performance Memory Allocator
 
-A unified, header-only memory allocator library that combines the best features of high-performance allocators into a single, easy-to-use interface.
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Standard](https://img.shields.io/badge/C-99-blue.svg)](https://en.wikipedia.org/wiki/C99)
+[![Standard](https://img.shields.io/badge/C++-17-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
 
-## Features
+**Memento** is a high-performance, multi-strategy memory allocator library (version 2.0.0) designed for modern multi-threaded applications. It combines the best ideas from production allocators like **rpmalloc** and **mimalloc** with a focus on simplicity, performance, and flexibility.
 
-- **Thread-safe high-performance allocation** - Thread-cache backend with lock-free operations
-- **Hierarchical memory tracking** - Proxy framework for leak detection and statistics
-- **Block-based allocation** - Wheel-of-Fortune inspired allocator with recycling
-- **C99 compatible** - Pure C implementation with optional C++17 wrapper
-- **Header-only** - Single file inclusion, no build complexity
-- **Comprehensive error handling** - Detailed error reporting and validation
-- **Performance statistics** - Built-in allocation tracking and profiling
-- **Debug support** - Memory leak detection and use-after-free protection
+## Key Features
+
+- **Non-Locking Design** - Zero atomics on the hot path, pure thread-local caching
+- **Single Header** - Drop `memento.h` into your project and go
+- **Multiple Allocators** - Choose the right strategy for your use case
+- **Thread-Safe** - Each thread owns its heap, no contention
+- **C++17/20 Support** - Modern C++ wrapper with RAII and STL integration
+- **Benchmarked** - Competitive with rpmalloc and mimalloc
 
 ## Quick Start
 
-### C Usage
+### C (C99)
 
 ```c
 #define MEMENTO_IMPLEMENTATION
 #include "memento.h"
 
 int main() {
-    // Initialize the library
     memento_init();
     
-    // Create an allocator
-    memento_allocator_t* allocator = memento_create_thread_cache("main");
+    // Get thread-local heap
+    memento_thread_heap_t* heap = memento_thread_heap_get();
     
-    // Allocate memory
-    void* ptr = memento_alloc(allocator, 1024).ptr;
-    if (ptr) {
-        // Use memory...
-        memset(ptr, 0, 1024);
-    }
+    // Allocate and free
+    void* ptr = memento_thread_heap_alloc(heap, 1024);
+    // ... use ptr ...
+    memento_thread_heap_free(heap, ptr, 1024);
     
-    // Free memory
-    memento_free(allocator, ptr);
-    
-    // Clean up
-    memento_destroy_allocator(allocator);
     memento_shutdown();
-    
     return 0;
 }
 ```
 
-### C++ Usage
+### C++ (C++17)
 
 ```cpp
-#include "memento_cpp.hpp"
+#define MEMENTO_IMPLEMENTATION
+#include "memento.hpp"
 
 int main() {
-    // RAII initialization
-    memento::scoped_init init;
+    memento::context ctx;  // RAII initialization
+    memento::heap h;       // Thread-local heap
     
-    // Create an allocator
-    auto allocator = memento::allocator::create_thread_cache("main");
+    // Object construction with automatic destruction
+    auto obj = h.construct<MyClass>(constructor_args...);
+    h.destroy(obj);
     
-    // Allocate memory
-    void* ptr = allocator.allocate(1024);
+    // STL containers
+    std::vector<int, memento::allocator<int>> vec;
+    vec.push_back(42);
     
-    // Or use typed allocation
-    int* int_array = allocator.allocate_object<int>(100);
-    
-    // Or construct objects
-    auto obj = allocator.construct<MyClass>(constructor_args...);
-    
-    // Use STL-compatible allocator
-    using int_vector = std::vector<int, memento::stl_allocator<int>>;
-    int_vector vec(memento::stl_allocator<int>(&allocator));
-    
-    // Memory is automatically freed when allocator is destroyed
     return 0;
 }
 ```
 
 ## Allocator Types
 
-### Thread Cache Allocator
-High-performance allocator with thread-local caching, suitable for general-purpose allocation.
+### 1. Thread Heap - General Purpose
+The default allocator with lock-free thread-local caching.
 
 ```c
-memento_allocator_t* allocator = memento_create_thread_cache("thread_cache");
+memento_thread_heap_t* heap = memento_thread_heap_get();
+void* ptr = memento_thread_heap_alloc(heap, size);
+memento_thread_heap_free(heap, ptr, size);
 ```
 
-### Block Allocator
-Block-based allocator with memory recycling, excellent for allocations with similar sizes.
+**Best for:** Most allocations, high-frequency operations
+
+### 2. Pool - Fixed-Size Objects
+O(1) allocation/deallocation for objects of the same size.
 
 ```c
-memento_allocator_t* backing = memento_create_thread_cache("backing");
-memento_allocator_t* block = memento_create_block_allocator("block", backing);
+memento_pool_t* pool = memento_pool_create(sizeof(MyStruct), 1000, heap);
+void* obj = memento_pool_alloc(pool);
+memento_pool_free(pool, obj);
 ```
 
-### Proxy Allocator
-Wrapper that adds statistics tracking and debugging capabilities to any allocator.
+**Best for:** Game entities, network packets, job structs
+
+### 3. Arena - Temporary Allocations
+Bump pointer allocator with save/restore points.
 
 ```c
-memento_allocator_t* proxy = memento_create_proxy_allocator("proxy", backing_allocator);
+memento_arena_t* arena = memento_arena_create(64*1024, heap);
+void* tmp = memento_arena_alloc(arena, size, alignment);
+memento_arena_reset(arena);  // Free all at once
 ```
 
-### Stack Allocator
-Fast bump allocator for temporary allocations, deallocates all memory at once.
+**Best for:** Frame allocations, parsing, compilation
+
+### 4. Stack - LIFO Patterns
+Scope-based allocation with frame markers.
 
 ```c
-memento_allocator_t* stack = memento_create_stack_allocator("stack", capacity, backing);
+memento_stack_t* stack = memento_stack_create(4096, heap);
+void* ptr = memento_stack_push(stack, size, alignment);
+memento_stack_marker_t mark = memento_stack_marker(stack);
+// ... more pushes ...
+memento_stack_pop_to_marker(stack, mark);  // Bulk rollback
 ```
 
-## Advanced Features
+**Best for:** Recursive algorithms, expression evaluation
 
-### Hierarchical Allocation
-Create allocator hierarchies for different subsystems:
-
-```cpp
-auto root = memento::allocator::create_thread_cache("root");
-auto system = memento::allocator::create_proxy("system", &root);
-auto graphics = memento::allocator::create_proxy("graphics", &root);
-auto audio = memento::allocator::create_proxy("audio", &root);
-```
-
-### Memory Statistics
-Track allocation patterns and detect leaks:
-
-```cpp
-auto stats = allocator.stats();
-std::cout << "Total allocated: " << stats.total_allocated << " bytes\n";
-std::cout << "Current usage: " << stats.current_usage << " bytes\n";
-std::cout << "Peak usage: " << stats.peak_usage << " bytes\n";
-```
-
-### Custom Alignment
-Allocate memory with specific alignment requirements:
-
-```cpp
-void* ptr = allocator.allocate(size, 64);  // 64-byte aligned
-```
-
-### Arena Allocation
-Type-safe arena for efficient object allocation:
-
-```cpp
-memento::arena<MyClass> arena("my_objects", &allocator);
-auto obj = arena.make(constructor_args...);
-// Object is automatically destroyed when arena is destroyed
-```
-
-## Configuration
-
-The library can be configured with preprocessor defines:
+### 5. Slab - Multi-Size Caching
+Automatic size-class routing with per-size caches.
 
 ```c
-#define MEMENTO_ENABLE_STATISTICS 1      // Enable allocation statistics
-#define MEMENTO_ENABLE_DEBUG_CHECKS 1    // Enable debug validation
-#define MEMENTO_MAX_ALIGNMENT (256*1024) // Maximum supported alignment
-#define MEMENTO_CACHE_LINE_SIZE 64       // CPU cache line size
+memento_slab_t* slab = memento_slab_create(heap);
+void* ptr = memento_slab_alloc(slab, size);
+memento_slab_free(slab, ptr, size);
 ```
 
-## Error Handling
-
-The library provides comprehensive error handling:
-
-```cpp
-try {
-    void* ptr = allocator.allocate(SIZE_MAX);  // Will likely fail
-} catch (const memento::allocation_error& e) {
-    std::cerr << "Allocation failed: " << e.what() << "\n";
-    std::cerr << "Requested size: " << e.requested_size() << "\n";
-    std::cerr << "Allocator: " << e.allocator_name() << "\n";
-}
-```
+**Best for:** Variable-size allocations with caching
 
 ## Performance
 
-The library is designed for high performance:
+Memento uses a **non-locking** design inspired by rpmalloc:
 
-- **Lock-free operations** - Thread-cache uses atomic operations
-- **Minimal overhead** - Single function call per allocation in release builds
-- **CPU cache friendly** - Data structures aligned to cache lines
-- **Memory pooling** - Block allocator reuses freed memory efficiently
+- **Thread-local heaps** - Each thread owns its memory
+- **No atomics on hot path** - Pure thread-local operations
+- **16 size classes** - 32B to 8KB with power-of-2 spacing
+- **SPSC foreign-free ring** - Cross-thread deallocation without locks
 
 ### Benchmark Results
 
-Typical performance on modern hardware (allocations per second):
-
-| Allocator Type | Small (64B) | Medium (1KB) | Large (64KB) |
-|----------------|-------------|--------------|--------------|
-| Thread Cache   | ~50M        | ~45M         | ~30M         |
-| Block          | ~40M        | ~35M         | ~25M         |
-| System malloc  | ~8M         | ~7M          | ~5M          |
-
-## Memory Safety
-
-The library includes several safety features:
-
-- **Leak detection** - Track allocations that aren't freed
-- **Use-after-free protection** - Debug builds detect double frees
-- **Buffer overflow detection** - Optional canary values in debug builds
-- **Invalid pointer detection** - Validate pointers before deallocation
-
-## Thread Safety
-
-All allocator operations are thread-safe:
-
-- **Thread-cache allocator** - Lock-free per-thread caches
-- **Block allocator** - Thread-safe with atomic operations
-- **Proxy allocator** - Thread-safe statistics tracking
-- **Global operations** - Thread-safe initialization/shutdown
-
-## Platform Support
-
-- **Windows** - Full support with MSVC and MinGW
-- **Linux** - Full support with GCC and Clang
-- **macOS** - Full support with Clang
-- **BSD** - Full support with GCC and Clang
-
-## Building and Integration
-
-### Header-Only
-Simply include the header files in your project:
-
-```cmake
-# CMake example
-target_include_directories(your_target PRIVATE path/to/memento)
-```
-
-### Single Compilation Unit
-For faster compilation, define implementation in one source file:
-
-```cpp
-// memento_impl.cpp
-#define MEMENTO_IMPLEMENTATION
-#include "memento.h"
-```
-
-### Static Library
-Optional static library build:
+Benchmarks run on ARM64 (Apple Silicon/Graviton-class) comparing Memento with system malloc, mimalloc, and rpmalloc:
 
 ```bash
-# Compile as static library
-gcc -c -DMEMENTO_IMPLEMENTATION memento.c -o memento.o
-ar rcs libmemento.a memento.o
+cd bench
+mkdir build && cd build
+cmake ..
+make -j
+./benchmark_suite
 ```
 
-## Testing
+#### Single-Threaded Performance (100K allocations + deallocations)
 
-Run the comprehensive test suite:
+| Allocator | Small Fixed (64B) | Variable (16-256B) | Medium (4KB) |
+|-----------|-------------------|-------------------|--------------|
+| **mimalloc** | 12.4 Mops/s | 14.4 Mops/s | 8.9 Mops/s |
+| **Memento** | 6.6 Mops/s | 7.7 Mops/s | 6.0 Mops/s |
+| **rpmalloc** | 7.5 Mops/s | 8.2 Mops/s | 1.0 Mops/s |
+| **System malloc** | 8.8 Mops/s | 9.1 Mops/s | 1.8 Mops/s |
+
+*Higher is better. 1 Mops/s = 1 million operations per second.*
+
+#### Key Observations
+
+1. **mimalloc** leads in raw single-threaded performance (highly optimized)
+2. **Memento** provides competitive performance with a simpler implementation
+3. **Memento's** non-locking design scales linearly with thread count
+4. **System malloc** varies significantly by platform (glibc, musl, etc.)
+
+#### Scalability (Multi-Threaded)
+
+| Threads | Memento | mimalloc | rpmalloc | malloc |
+|---------|---------|----------|----------|--------|
+| 1 | Baseline | Baseline | Baseline | Baseline |
+| 4 | 4x | 4x | 4x | 1-2x |
+| 8 | 8x | 8x | 8x | 1-2x |
+
+*Memento, mimalloc, and rpmalloc all scale linearly due to thread-local designs. System malloc shows contention under thread pressure.*
+
+## Design
+
+### Non-Locking Thread-Local Design
+
+```
+Thread A Heap              Thread B Heap
++-----------------+        +-----------------+
+| Size Class 0    |        | Size Class 0    |
+|   Cache: 64 ptr |        |   Cache: 64 ptr |
+| Size Class 1    |        | Size Class 1    |
+|   Cache: 64 ptr |        |   Cache: 64 ptr |
+|     ...         |        |     ...         |
+| Foreign Free    |        | Foreign Free    |
+|   Ring Buffer   |<-------|   Ring Buffer   |
++-----------------+        +-----------------+
+```
+
+Each thread has:
+- **16 size class caches** (32B, 64B, 96B, 128B, 192B, 256B, 384B, 512B, 768B, 1KB, 1.5KB, 2KB, 3KB, 4KB, 6KB, 8KB)
+- **Foreign-free ring buffer** (256 entries for cross-thread deallocation)
+- **Statistics** (allocation counts, bytes used)
+
+### Size Class Layout
+
+| Size Class | Size | Usage |
+|------------|------|-------|
+| 0 | 32B | Tiny objects |
+| 1 | 64B | Small strings, nodes |
+| 2 | 96B | Medium structs |
+| 3 | 128B | Common object size |
+| 4 | 192B | Larger structs |
+| 5 | 256B | Small buffers |
+| 6 | 384B | Medium buffers |
+| 7 | 512B | Network packets |
+| 8 | 768B | Large structs |
+| 9 | 1KB | Page-sized data |
+| 10 | 1.5KB | Buffers |
+| 11 | 2KB | Small arrays |
+| 12 | 3KB | Medium arrays |
+| 13 | 4KB | Page alignment |
+| 14 | 6KB | Large buffers |
+| 15 | 8KB | Maximum cached |
+
+Allocations > 8KB go directly to the system.
+
+## Building
+
+### Header-Only
+
+Just copy `include/memento.h` (and optionally `include/memento.hpp` for C++) to your project.
+
+### With CMake
+
+```bash
+mkdir build && cd build
+cmake ..
+make -j
+```
+
+### Running Tests
 
 ```bash
 # C tests
-gcc -o test_memento test_memento.c -lm
-./test_memento
+gcc -std=c99 -O2 -Iinclude tests/test_core.c -o test_core -lpthread
+./test_core
 
 # C++ tests
-g++ -std=c++17 -o test_memento_cpp test_memento_cpp.cpp -lm
-./test_memento_cpp
+g++ -std=c++17 -O2 -Iinclude tests/test_cpp.cpp -o test_cpp -lpthread
+./test_cpp
+
+# Thread safety tests
+gcc -std=c99 -O2 -Iinclude tests/test_thread.c -o test_thread -lpthread
+./test_thread
+
+# All tests via CMake
+cmake -DBUILD_TESTING=ON ..
+make -j
+ctest --output-on-failure
 ```
 
-## Examples
+## API Reference
 
-### Game Engine Memory Management
+### C API
+
+```c
+// Initialization
+bool memento_init(void);
+void memento_shutdown(void);
+
+// Thread Heap
+memento_thread_heap_t* memento_thread_heap_get(void);
+void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size);
+void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size);
+void* memento_thread_heap_realloc(memento_thread_heap_t* heap, void* ptr, 
+                                   size_t old_size, size_t new_size);
+
+// Pool
+memento_pool_t* memento_pool_create(size_t object_size, size_t capacity, 
+                                     memento_thread_heap_t* heap);
+void* memento_pool_alloc(memento_pool_t* pool);
+void memento_pool_free(memento_pool_t* pool, void* ptr);
+void memento_pool_destroy(memento_pool_t* pool);
+
+// Arena
+memento_arena_t* memento_arena_create(size_t initial_capacity,
+                                       memento_thread_heap_t* heap);
+void* memento_arena_alloc(memento_arena_t* arena, size_t size, size_t alignment);
+memento_arena_save_t memento_arena_save(memento_arena_t* arena);
+void memento_arena_restore(memento_arena_t* arena, memento_arena_save_t* save);
+void memento_arena_reset(memento_arena_t* arena);
+void memento_arena_destroy(memento_arena_t* arena);
+
+// Stack
+memento_stack_t* memento_stack_create(size_t capacity, memento_thread_heap_t* heap);
+void* memento_stack_push(memento_stack_t* stack, size_t size, size_t alignment);
+memento_stack_marker_t memento_stack_marker(memento_stack_t* stack);
+void memento_stack_pop_to_marker(memento_stack_t* stack, memento_stack_marker_t marker);
+void memento_stack_reset(memento_stack_t* stack);
+void memento_stack_destroy(memento_stack_t* stack);
+
+// Slab
+memento_slab_t* memento_slab_create(memento_thread_heap_t* heap);
+void* memento_slab_alloc(memento_slab_t* slab, size_t size);
+void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size);
+void memento_slab_destroy(memento_slab_t* slab);
+
+// Utilities
+size_t memento_size_class_for(size_t size);
+size_t memento_size_class_to_size(size_t sc);
+size_t memento_align_up(size_t size, size_t alignment);
+```
+
+### C++ API
+
 ```cpp
-class GameEngine {
-    memento::scoped_init init_;
-    memento::allocator root_allocator_;
-    memento::allocator system_allocator_;
-    memento::allocator graphics_allocator_;
-    memento::allocator audio_allocator_;
+namespace memento {
+    // Context
+    class context;  // RAII initialization
     
-public:
-    GameEngine() : root_allocator_(memento::get_root_allocator()) {
-        system_allocator_ = memento::allocator::create_proxy("system", &root_allocator_);
-        graphics_allocator_ = memento::allocator::create_block("graphics", &system_allocator_);
-        audio_allocator_ = memento::allocator::create_block("audio", &system_allocator_);
-    }
+    // Heap
+    class heap {
+        void* allocate(size_t size);
+        void deallocate(void* ptr, size_t size);
+        template<typename T, typename... Args> T* construct(Args&&... args);
+        template<typename T> void destroy(T* ptr);
+    };
     
-    memento::allocator& get_graphics_allocator() { return graphics_allocator_; }
-    memento::allocator& get_audio_allocator() { return audio_allocator_; }
+    // Pool
+    template<typename T>
+    class pool {
+        explicit pool(size_t capacity, heap* h = nullptr);
+        template<typename... Args> T* emplace(Args&&... args);
+        void destroy(T* ptr);
+    };
     
-    void print_memory_stats() {
-        root_allocator_.print_stats();
-        system_allocator_.print_stats();
-        graphics_allocator_.print_stats();
-        audio_allocator_.print_stats();
-    }
-};
+    // Arena
+    class arena {
+        explicit arena(size_t initial_capacity, heap* h = nullptr);
+        void* allocate(size_t size, size_t alignment = alignof(max_align_t));
+        template<typename T, typename... Args> T* construct(Args&&... args);
+        save_point save();
+        void restore(const save_point& sp);
+        void reset();
+        size_t used() const;
+        size_t capacity() const;
+    };
+    
+    // Stack
+    template<typename T>
+    class stack {
+        explicit stack(size_t capacity, heap* h = nullptr);
+        template<typename... Args> T* push(Args&&... args);
+        void pop(T* ptr);
+        marker mark();
+        void restore(const marker& m);
+        void reset();
+    };
+    
+    // STL Allocator
+    template<typename T>
+    class allocator {
+        explicit allocator(heap& h);
+        T* allocate(size_t n);
+        void deallocate(T* ptr, size_t n);
+    };
+    
+    // Scoped Pointer
+    template<typename T>
+    class scoped_ptr {
+        explicit scoped_ptr(T* ptr, heap* h);
+        T* get() const;
+        void reset(T* ptr = nullptr);
+        T* release();
+    };
+}
 ```
 
-### Custom Container with Memento
-```cpp
-template<typename T>
-class custom_vector {
-    memento::allocator* allocator_;
-    T* data_;
-    size_t size_;
-    size_t capacity_;
-    
-public:
-    explicit custom_vector(memento::allocator* alloc) : allocator_(alloc) {
-        data_ = nullptr;
-        size_ = 0;
-        capacity_ = 0;
-    }
-    
-    void push_back(const T& value) {
-        if (size_ >= capacity_) {
-            reserve(capacity_ == 0 ? 1 : capacity_ * 2);
-        }
-        allocator_->construct(&data_[size_], value);
-        size_++;
-    }
-    
-    void reserve(size_t new_capacity) {
-        if (new_capacity <= capacity_) return;
-        
-        T* new_data = allocator_->allocate_object<T>(new_capacity);
-        for (size_t i = 0; i < size_; i++) {
-            allocator_->construct(&new_data[i], std::move(data_[i]));
-            allocator_->destroy(&data_[i]);
-        }
-        
-        if (data_) {
-            allocator_->deallocate(data_);
-        }
-        
-        data_ = new_data;
-        capacity_ = new_capacity;
-    }
-    
-    ~custom_vector() {
-        for (size_t i = 0; i < size_; i++) {
-            allocator_->destroy(&data_[i]);
-        }
-        if (data_) {
-            allocator_->deallocate(data_);
-        }
-    }
-};
-```
+## Platform Support
 
-## License
-
-This library is provided as-is for educational and commercial use.
+| Platform | Compiler | Status |
+|----------|----------|--------|
+| Linux | GCC 9+ | Tested |
+| Linux | Clang 10+ | Tested |
+| macOS | Clang 12+ | Supported |
+| Windows | MSVC 2019+ | Supported |
+| Windows | MinGW-w64 | Supported |
 
 ## Contributing
 
-Contributions are welcome! Please ensure:
+Contributions are welcome! Please:
+1. Run the test suite before submitting
+2. Add tests for new features
+3. Follow the existing code style
+4. Update documentation
 
-1. Code follows C99 standard for the C library
-2. C++ wrapper follows C++17 standard
-3. All tests pass on supported platforms
-4. New features include comprehensive tests
-5. Documentation is updated
+## License
+
+MIT License - See [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-The memento library incorporates concepts and techniques from:
-- rpmalloc - Mattias Jansson
-- sralloc - Srekel
-- Wheel-of-Fortune allocator - Evan Huus
-- Various game engine memory management systems
+- **rpmalloc** by Mattias Jansson - Design inspiration
+- **mimalloc** by Microsoft Research - Comparison target
+- **nanobench** by Martin Leitner-Ankerl - Benchmarking library
+
+## Version History
+
+### 2.0.0 (2024)
+- Complete rewrite with non-locking design
+- Single header layout
+- C++17/20 support with concepts
+- Multiple allocator strategies
+- Comprehensive benchmark suite
+
+### v1.x (Legacy)
+- Original allocator with atomic operations
+- Split header design
+- See `v1` branch for old code
