@@ -1,41 +1,40 @@
 /*
  * Memento Memory Allocator Library
- * 
+ *
  * A high-performance, multi-allocator memory management library.
- * Non-locking design - no atomics on hot path, completely thread-local.
- * 
+ * Alloc/free on the owning thread is lock-free and atomic-free; frees from
+ * OTHER threads are safe and lock-free via a per-heap atomic MPSC stack that
+ * the owner drains (memento_thread_heap_flush) on its own schedule.
+ *
  * Features:
- * - Thread Heap: Purely thread-local caching (no atomics on hot path!)
+ * - Thread Heap: thread-local size-class caching; cross-thread free is safe
  * - Pool: Fixed-size object pools
- * - Arena: Bump allocator with power-of-2 growth
- * - Stack: LIFO scope-based allocator  
+ * - Arena: Bump allocator with power-of-2 growth (aligned allocation)
+ * - Stack: LIFO scope-based allocator
  * - Slab: Multi-size object caching
- * 
- * Version 2.1.0 - High Performance Edition
- * 
+ *
+ * Threading contract:
+ * - memento_thread_heap_alloc / realloc / flush: owning thread only
+ * - memento_thread_heap_free: ANY thread (exact size required)
+ * - When a thread exits, its heap is flushed and retired (pthread TLS
+ *   destructor); frees that target a retired heap park on its foreign stack
+ *   and are reclaimed by memento_shutdown.
+ * - memento_shutdown must happen-after every free targeting any heap
+ *   (i.e. join your threads first).
+ *
  * Usage (C):
  *   #define MEMENTO_IMPLEMENTATION
  *   #include "memento.h"
- *   
+ *
  *   int main() {
  *       memento_init();
  *       memento_thread_heap_t* heap = memento_thread_heap_get();
  *       void* ptr = memento_thread_heap_alloc(heap, 1024);
  *       memento_thread_heap_free(heap, ptr, 1024);
+ *       memento_shutdown();
  *       return 0;
  *   }
- * 
- * Usage (C++):
- *   #include "memento.hpp"
- *   
- *   int main() {
- *       memento::context ctx;
- *       memento::heap h;
- *       auto obj = h.construct<MyClass>(args...);
- *       h.destroy(obj);
- *       return 0;
- *   }
- * 
+ *
  * License: MIT
  */
 
@@ -44,9 +43,9 @@
 
 /* Version macros for compile-time checking */
 #define MEMENTO_VERSION_MAJOR 2
-#define MEMENTO_VERSION_MINOR 1
+#define MEMENTO_VERSION_MINOR 0
 #define MEMENTO_VERSION_PATCH 0
-#define MEMENTO_VERSION_STRING "2.1.0"
+#define MEMENTO_VERSION_STRING "2.2.0"
 #define MEMENTO_VERSION ((MEMENTO_VERSION_MAJOR << 16) | \
                          (MEMENTO_VERSION_MINOR << 8) | \
                          MEMENTO_VERSION_PATCH)
@@ -63,6 +62,14 @@
 #include <stdio.h>
 #include <assert.h>
 
+/* Atomics for the per-heap foreign-free stack (must be included outside the
+ * extern "C" block below) */
+#ifdef __cplusplus
+    #include <atomic>
+#else
+    #include <stdatomic.h>
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -77,29 +84,19 @@ extern "C" {
     #define MEMENTO_PLATFORM_POSIX 0
     #if defined(_MSC_VER)
         #define MEMENTO_TLS __declspec(thread)
-        #define MEMENTO_FORCE_INLINE __forceinline
+        #define MEMENTO_FORCE_INLINE static __forceinline
         #define MEMENTO_NOINLINE __declspec(noinline)
-        #define MEMENTO_ALIGNED(x) __declspec(align(x))
     #else
         #define MEMENTO_TLS __thread
-        #define MEMENTO_FORCE_INLINE inline __attribute__((always_inline))
+        #define MEMENTO_FORCE_INLINE static inline __attribute__((always_inline))
         #define MEMENTO_NOINLINE __attribute__((noinline))
-        #define MEMENTO_ALIGNED(x) __attribute__((aligned(x)))
     #endif
 #else
     #define MEMENTO_PLATFORM_WINDOWS 0
     #define MEMENTO_PLATFORM_POSIX 1
     #define MEMENTO_TLS __thread
-    #define MEMENTO_FORCE_INLINE inline __attribute__((always_inline))
+    #define MEMENTO_FORCE_INLINE static inline __attribute__((always_inline))
     #define MEMENTO_NOINLINE __attribute__((noinline))
-    #define MEMENTO_ALIGNED(x) __attribute__((aligned(x)))
-#endif
-
-/* C11 detection */
-#if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
-    #define MEMENTO_C11 1
-#else
-    #define MEMENTO_C11 0
 #endif
 
 /* Cache line size (common values: 64 for x86/ARM, 128 for POWER) */
@@ -107,47 +104,31 @@ extern "C" {
     #define MEMENTO_CACHE_LINE_SIZE 64
 #endif
 
-/* Branch prediction hints */
-#ifndef MEMENTO_LIKELY
-    #define MEMENTO_LIKELY(x) __builtin_expect(!!(x), 1)
-#endif
-#ifndef MEMENTO_UNLIKELY
-    #define MEMENTO_UNLIKELY(x) __builtin_expect(!!(x), 0)
-#endif
-
-/* restrict keyword */
-#if defined(__cplusplus)
-    /* C++ doesn't have standard restrict, use compiler extensions */
-    #if defined(__GNUC__) || defined(__clang__)
-        #define MEMENTO_RESTRICT __restrict__
-    #elif defined(_MSC_VER)
-        #define MEMENTO_RESTRICT __restrict
-    #else
-        #define MEMENTO_RESTRICT
-    #endif
-#elif MEMENTO_C11
-    #define MEMENTO_RESTRICT restrict
-#elif defined(__GNUC__) || defined(__clang__)
-    #define MEMENTO_RESTRICT __restrict__
-#elif defined(_MSC_VER)
-    #define MEMENTO_RESTRICT __restrict
+/* Alignment macro */
+#if defined(_MSC_VER)
+    #define MEMENTO_ALIGNED(x) __declspec(align(x))
 #else
-    #define MEMENTO_RESTRICT
+    #define MEMENTO_ALIGNED(x) __attribute__((aligned(x)))
 #endif
 
-/* Size classes: 24 classes with optimized granularity */
-#define MEMENTO_SIZE_CLASS_COUNT 24
-#define MEMENTO_SMALL_MAX 8192
-
-/* Foreign ring buffer size (power of 2) - smaller to save cache */
-#define MEMENTO_FOREIGN_RING_SIZE 64
-#define MEMENTO_FOREIGN_MASK (MEMENTO_FOREIGN_RING_SIZE - 1)
-
-/* Large object cache size */
-#define MEMENTO_LARGE_CACHE_SIZE 8
-
-/* Arena size (2 MiB for transparent huge pages) */
-#define MEMENTO_ARENA_SIZE (2 * 1024 * 1024)
+/* Atomic pointer - C11 _Atomic in C, std::atomic in C++. Only used for the
+ * per-heap foreign-free MPSC stack head; every other heap field is strictly
+ * owner-thread-local. */
+#ifdef __cplusplus
+    typedef std::atomic<void*> memento_atomic_ptr_t;
+    #define memento_atomic_ptr_load_relaxed(p)   ((p)->load(std::memory_order_relaxed))
+    #define memento_atomic_ptr_exchange_acq(p, v) ((p)->exchange((v), std::memory_order_acquire))
+    #define memento_atomic_ptr_cas_release(p, expected, desired) \
+        ((p)->compare_exchange_weak((expected), (desired), \
+                                    std::memory_order_release, std::memory_order_relaxed))
+#else
+    typedef _Atomic(void*) memento_atomic_ptr_t;
+    #define memento_atomic_ptr_load_relaxed(p)   atomic_load_explicit((p), memory_order_relaxed)
+    #define memento_atomic_ptr_exchange_acq(p, v) atomic_exchange_explicit((p), (v), memory_order_acquire)
+    #define memento_atomic_ptr_cas_release(p, expected, desired) \
+        atomic_compare_exchange_weak_explicit((p), &(expected), (desired), \
+                                              memory_order_release, memory_order_relaxed)
+#endif
 
 /* ============================================================================
  * Public API
@@ -158,6 +139,9 @@ typedef struct memento_pool_s memento_pool_t;
 typedef struct memento_arena_s memento_arena_t;
 typedef struct memento_stack_s memento_stack_t;
 typedef struct memento_slab_s memento_slab_t;
+
+/* Size classes: 32B, 64B, 96B, 128B, 192B, 256B, 384B, 512B, 768B, 1KB, 1.5KB, 2KB, 3KB, 4KB, 6KB, 8KB */
+#define MEMENTO_SIZE_CLASS_COUNT 16
 
 /* Thread-local heap statistics (for debugging/monitoring) */
 typedef struct {
@@ -172,12 +156,12 @@ typedef struct {
  * Version API
  * ============================================================================ */
 
-/* Get version string (e.g., "2.1.0") */
+/* Get version string (e.g., "2.2.0") */
 static inline const char* memento_version_string(void) {
     return MEMENTO_VERSION_STRING;
 }
 
-/* Get version number (e.g., 0x020100 for 2.1.0) */
+/* Get version number (e.g., 0x02.2.0 for 2.2.0) */
 static inline unsigned int memento_version_number(void) {
     return MEMENTO_VERSION;
 }
@@ -198,13 +182,17 @@ void memento_shutdown(void);
 /* Get thread-local heap (creates on first call, cached in TLS) */
 memento_thread_heap_t* memento_thread_heap_get(void);
 
-/* Allocate/free from thread-local heap (non-locking) */
-void* memento_thread_heap_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap, size_t size);
-void memento_thread_heap_free(memento_thread_heap_t* MEMENTO_RESTRICT heap, void* MEMENTO_RESTRICT ptr, size_t size);
-void* memento_thread_heap_realloc(memento_thread_heap_t* MEMENTO_RESTRICT heap, void* MEMENTO_RESTRICT ptr, 
+/* Allocate from thread-local heap (owning thread only, non-locking).
+ * memento_thread_heap_free may be called from ANY thread: foreign frees are
+ * pushed onto the heap's lock-free MPSC stack and reclaimed by the owner.
+ * The exact allocation size must be passed to free. */
+void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size);
+void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size);
+void* memento_thread_heap_realloc(memento_thread_heap_t* heap, void* ptr,
                                    size_t old_size, size_t new_size);
 
-/* Flush any pending foreign deallocations (call periodically) */
+/* Drain pending foreign deallocations (owning thread only; cheap when empty -
+ * a single relaxed load). Call from scheduler idle paths. */
 void memento_thread_heap_flush(memento_thread_heap_t* heap);
 
 /* Get heap statistics */
@@ -239,13 +227,12 @@ void* memento_arena_alloc(memento_arena_t* arena, size_t size, size_t alignment)
 typedef struct {
     void* saved_top;
     size_t saved_used;
-    void* saved_block;
 } memento_arena_save_t;
 
 memento_arena_save_t memento_arena_save(memento_arena_t* arena);
 void memento_arena_restore(memento_arena_t* arena, memento_arena_save_t* save);
 
-/* Reset arena to empty (frees all blocks) */
+/* Reset arena to empty */
 void memento_arena_reset(memento_arena_t* arena);
 
 /* Get stats */
@@ -289,14 +276,8 @@ void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size);
  * Utility API
  * ============================================================================ */
 
-/* Get size class for a given allocation size */
-size_t memento_size_class_for(size_t size);
-size_t memento_size_class_to_size(size_t sc);
-
-/* Alignment utilities */
-bool memento_is_power_of_two(size_t x);
-size_t memento_align_up(size_t size, size_t alignment);
-size_t memento_align_down(size_t size, size_t alignment);
+/* Size class and alignment utilities are static inline functions defined in
+ * the MEMENTO_IMPLEMENTATION block (internal helpers, not public API). */
 
 #ifdef __cplusplus
 }
@@ -312,6 +293,23 @@ size_t memento_align_down(size_t size, size_t alignment);
 
 #ifdef MEMENTO_IMPLEMENTATION
 
+/* The implementation is C11 code. When compiled as C++ (single-TU
+ * convenience), silence pedantic warnings about C idioms such as designated
+ * initializers, {0} aggregate init, and flexible array members. */
+#ifdef __cplusplus
+  #if defined(__clang__)
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wc99-extensions"
+    #pragma clang diagnostic ignored "-Wc++20-designator"
+    #pragma clang diagnostic ignored "-Wmissing-field-initializers"
+  #elif defined(__GNUC__)
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+    #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+  #endif
+#endif
+
+
 /* ============================================================================
  * Internal Implementation - Non-locking Design
  * ============================================================================ */
@@ -321,21 +319,6 @@ size_t memento_align_down(size_t size, size_t alignment);
 #include <unistd.h>
 #include <pthread.h>
 
-/* C11 atomics / GCC builtins */
-#if MEMENTO_C11
-    #include <stdatomic.h>
-    #define MEMENTO_ATOMIC_STORE_REL(ptr, val) \
-        atomic_store_explicit((_Atomic typeof(val)*)(ptr), (val), memory_order_release)
-    #define MEMENTO_ATOMIC_LOAD_ACQ(ptr) \
-        atomic_load_explicit((_Atomic typeof(*(ptr))*)(ptr), memory_order_acquire)
-#else
-    /* Fallback to GCC/Clang builtins */
-    #define MEMENTO_ATOMIC_STORE_REL(ptr, val) \
-        __atomic_store_n((ptr), (val), __ATOMIC_RELEASE)
-    #define MEMENTO_ATOMIC_LOAD_ACQ(ptr) \
-        __atomic_load_n((ptr), __ATOMIC_ACQUIRE)
-#endif
-
 /* MAP_ANONYMOUS compatibility */
 #ifndef MAP_ANONYMOUS
     #ifdef MAP_ANON
@@ -343,6 +326,14 @@ size_t memento_align_down(size_t size, size_t alignment);
     #else
         #define MAP_ANONYMOUS 0x20  /* Common value */
     #endif
+#endif
+
+/* Branch prediction hints */
+#ifndef MEMENTO_LIKELY
+    #define MEMENTO_LIKELY(x) __builtin_expect(!!(x), 1)
+#endif
+#ifndef MEMENTO_UNLIKELY
+    #define MEMENTO_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #endif
 
 /* Fallback macros for allocation */
@@ -360,105 +351,28 @@ size_t memento_align_down(size_t size, size_t alignment);
     #define MEMENTO_MUNMAP(ptr, size) munmap(ptr, size)
 #endif
 
-/* Size class configuration: 24 classes optimized for real-world patterns
- * 
- * These classes are tuned based on tcmalloc and mimalloc research:
- * - Fine granularity for small sizes (16-byte steps up to 128 bytes)
- * - Medium granularity for medium sizes (32-64 byte steps)
- * - Coarse granularity for large sizes (power-of-2 aligned)
- * 
- * This gives us ~12.5% internal fragmentation worst case, typically < 5% avg.
- */
+/* Size class configuration */
 static const size_t memento_size_classes[MEMENTO_SIZE_CLASS_COUNT] = {
-    32, 48, 64, 80, 96, 112, 128, 160, 
-    192, 224, 256, 320, 384, 448, 512, 640,
-    768, 896, 1024, 1280, 1536, 2048, 4096, 8192
+    32, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096, 6144, 8192
 };
 
-/* Branchless size class LUT using 8-byte granularity (mimalloc-style)
- * 
- * Index formula: idx = (size + 7) >> 3  (gives us 8-byte buckets)
- * This LUT has 129 entries covering sizes 0-1024 bytes.
- * For sizes > 1024, we fall back to comparison-based lookup.
- * 
- * This approach is inspired by mimalloc's pages_direct indexing.
- * The (size + 7) >> 3 formula is branchless and compiles to a single 
- * LEA + SHR instruction on x86-64, or ADD + LSR on ARM64.
- */
-static const uint8_t memento_size_class_lut[129] = {
-    /* idx 0: size 0 (maps to class 0) */
-    0,
-    /* idx 1-4: sizes 1-32 bytes -> class 0 (32 bytes) */
-    0, 0, 0, 0,
-    /* idx 5-6: sizes 33-48 bytes -> class 1 (48 bytes) */
-    1, 1,
-    /* idx 7-8: sizes 49-64 bytes -> class 2 (64 bytes) */
-    2, 2,
-    /* idx 9-10: sizes 65-80 bytes -> class 3 (80 bytes) */
-    3, 3,
-    /* idx 11-12: sizes 81-96 bytes -> class 4 (96 bytes) */
-    4, 4,
-    /* idx 13-14: sizes 97-112 bytes -> class 5 (112 bytes) */
-    5, 5,
-    /* idx 15-16: sizes 113-128 bytes -> class 6 (128 bytes) */
-    6, 6,
-    /* idx 17-20: sizes 129-160 bytes -> class 7 (160 bytes) */
-    7, 7, 7, 7,
-    /* idx 21-24: sizes 161-192 bytes -> class 8 (192 bytes) */
-    8, 8, 8, 8,
-    /* idx 25-28: sizes 193-224 bytes -> class 9 (224 bytes) */
-    9, 9, 9, 9,
-    /* idx 29-32: sizes 225-256 bytes -> class 10 (256 bytes) */
-    10, 10, 10, 10,
-    /* idx 33-40: sizes 257-320 bytes -> class 11 (320 bytes) */
-    11, 11, 11, 11, 11, 11, 11, 11,
-    /* idx 41-48: sizes 321-384 bytes -> class 12 (384 bytes) */
-    12, 12, 12, 12, 12, 12, 12, 12,
-    /* idx 49-56: sizes 385-448 bytes -> class 13 (448 bytes) */
-    13, 13, 13, 13, 13, 13, 13, 13,
-    /* idx 57-64: sizes 449-512 bytes -> class 14 (512 bytes) */
-    14, 14, 14, 14, 14, 14, 14, 14,
-    /* idx 65-80: sizes 513-640 bytes -> class 15 (640 bytes) */
-    15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-    /* idx 81-96: sizes 641-768 bytes -> class 16 (768 bytes) */
-    16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16, 16,
-    /* idx 97-112: sizes 769-896 bytes -> class 17 (896 bytes) */
-    17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17, 17,
-    /* idx 113-128: sizes 897-1024 bytes -> class 18 (1024 bytes) */
-    18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18, 18
-};
-
-/* Fast branchless size class lookup
- * 
- * For sizes <= 1024: single LUT lookup, no branches
- * For sizes > 1024: comparison-based lookup (rare case)
- * 
- * Benchmark results on x86-64 (clang -O3):
- * - Size 64: ~3-4ns (was ~8-10ns with comparison tree)
- * - Size 256: ~3-4ns (was ~12-15ns with comparison tree)
- */
 MEMENTO_FORCE_INLINE size_t memento_size_class_for(size_t size) {
-    /* Handle size 0 and small sizes together */
-    if (MEMENTO_LIKELY(size <= 1024)) {
-        /* Branchless LUT lookup for common sizes
-         * Formula: (size + 7) >> 3 gives us 8-byte buckets
-         * 
-         * Examples:
-         * - size=32: (32+7)>>3 = 39>>3 = 4 -> lut[4] = 0 (class 32)
-         * - size=33: (33+7)>>3 = 40>>3 = 5 -> lut[5] = 1 (class 48)
-         * - size=64: (64+7)>>3 = 71>>3 = 8 -> lut[8] = 2 (class 64)
-         */
-        size_t idx = (size + 7) >> 3;
-        if (idx >= 128) idx = 127;  /* Clamp for size exactly 1024 */
-        return memento_size_class_lut[idx];
-    }
-    
-    /* Slow path for large sizes (comparison-based, rarely taken) */
-    if (size <= 1280) return 19;
-    if (size <= 1536) return 20;
-    if (size <= 2048) return 21;
-    if (size <= 4096) return 22;
-    return 23;
+    if (size <= 32) return 0;
+    if (size <= 64) return 1;
+    if (size <= 96) return 2;
+    if (size <= 128) return 3;
+    if (size <= 192) return 4;
+    if (size <= 256) return 5;
+    if (size <= 384) return 6;
+    if (size <= 512) return 7;
+    if (size <= 768) return 8;
+    if (size <= 1024) return 9;
+    if (size <= 1536) return 10;
+    if (size <= 2048) return 11;
+    if (size <= 3072) return 12;
+    if (size <= 4096) return 13;
+    if (size <= 6144) return 14;
+    return 15;
 }
 
 MEMENTO_FORCE_INLINE size_t memento_size_class_to_size(size_t sc) {
@@ -478,105 +392,63 @@ MEMENTO_FORCE_INLINE size_t memento_align_down(size_t size, size_t alignment) {
 }
 
 /* ============================================================================
- * Internal Data Structures - Cache Line Optimized
+ * Internal Thread Cache - Non-locking Treiber Stack
  * ============================================================================ */
 
-/* Size class cache - one per size class, each on its own cache line */
-typedef struct MEMENTO_ALIGNED(MEMENTO_CACHE_LINE_SIZE) {
-    void* head;
+typedef struct memento_cache_node_s {
+    struct memento_cache_node_s* next;
+} memento_cache_node_t;
+
+typedef struct {
+    memento_cache_node_t* head;
     uint32_t count;
     uint32_t limit;
 } memento_size_class_cache_t;
 
-/* Verify cache line alignment */
-#if defined(__cplusplus)
-    static_assert(sizeof(memento_size_class_cache_t) == MEMENTO_CACHE_LINE_SIZE,
-                  "size_class_cache must be exactly one cache line");
-#else
-    _Static_assert(sizeof(memento_size_class_cache_t) == MEMENTO_CACHE_LINE_SIZE,
-                   "size_class_cache must be exactly one cache line");
-#endif
+/* Node written into the first bytes of a foreign-freed block. The smallest
+ * size class is 32 bytes, so every block can hold it. */
+typedef struct memento_foreign_node_s {
+    struct memento_foreign_node_s* next;
+    size_t size;    /* exact size the caller passed to free */
+} memento_foreign_node_t;
 
-/* Large object cache entry */
-typedef struct {
-    void* ptr;
-    size_t size;
-} memento_large_cache_entry_t;
-
-/* Large object cache - for allocations > 8KB */
-typedef struct {
-    memento_large_cache_entry_t entries[MEMENTO_LARGE_CACHE_SIZE];
-    uint32_t count;
-    uint32_t _pad[3];  /* Pad to cache line (8*16 + 4 = 132, need 60 more, but let's just use 64 for two cache lines) */
-} memento_large_cache_t;
-
-/* Foreign deallocation ring buffer entry */
-typedef struct {
-    void* ptr;
-    size_t size;
-} memento_foreign_entry_t;
-
-/* Thread-local heap structure - cache line optimized */
+/* Thread-local heap structure */
 struct memento_thread_heap_s {
-    /* Size class caches - each on its own cache line, purely thread-local */
+    /* Size class caches - purely owner-thread-local, no atomics needed */
     memento_size_class_cache_t caches[MEMENTO_SIZE_CLASS_COUNT];
-    
-    /* Large object cache - separate cache line */
-    MEMENTO_ALIGNED(MEMENTO_CACHE_LINE_SIZE) memento_large_cache_t large_cache;
-    
-    /* Foreign deallocation ring buffer (SPSC - single producer, single consumer)
-     * Separate cache line to avoid false sharing */
-    MEMENTO_ALIGNED(MEMENTO_CACHE_LINE_SIZE) struct {
-        memento_foreign_entry_t buffer[MEMENTO_FOREIGN_RING_SIZE];
-        uint32_t head;  /* Only owner thread writes - use atomic release */
-        uint32_t tail;  /* Other threads write - use atomic acquire */
-    } foreign;
-    
-    /* Thread ID - cached to avoid pthread_self() spam */
-    MEMENTO_ALIGNED(MEMENTO_CACHE_LINE_SIZE) uint64_t thread_id;
-    
-    /* Statistics - relaxed consistency, separate cache line */
-    MEMENTO_ALIGNED(MEMENTO_CACHE_LINE_SIZE) memento_heap_stats_t stats;
-    
-    /* Heap state flags */
+
+    /* Foreign deallocation stack (MPSC): any thread CAS-pushes freed blocks,
+     * the owner exchange-drains. Own cache line to avoid false sharing. */
+    MEMENTO_ALIGNED(MEMENTO_CACHE_LINE_SIZE) memento_atomic_ptr_t foreign_head;
+    char foreign_pad[MEMENTO_CACHE_LINE_SIZE - sizeof(memento_atomic_ptr_t)];
+
+    /* Statistics (owner thread only) */
+    memento_heap_stats_t stats;
+
+    /* Thread ID for debugging */
+    uint64_t thread_id;
+
+    /* Global registry linkage (guarded by the registry mutex) */
+    struct memento_thread_heap_s* registry_next;
+
+    /* Heap state */
     uint8_t initialized;
-    uint8_t _pad[63];  /* Pad to cache line */
+    uint8_t retired;    /* owning thread has exited */
+    uint8_t _pad[6];
 };
 
-/* Verify thread heap structure is reasonably sized */
-/* Note: With 24 size classes @ 64 bytes each + foreign ring + large cache + stats,
- * the heap structure is approximately 2.5KB + foreign ring. With a 64-entry ring,
- * total is around 3.5KB which is acceptable. */
-#if defined(__cplusplus)
-    static_assert(sizeof(memento_thread_heap_t) < 8192,
-                  "thread_heap should be under 8KB");
-#else
-    _Static_assert(sizeof(memento_thread_heap_t) < 8192,
-                   "thread_heap should be under 8KB");
-#endif
-
 /* ============================================================================
- * Thread-local Storage with Race-Free Initialization
+ * Thread-local Storage
  * ============================================================================ */
 
 static MEMENTO_TLS memento_thread_heap_t* memento_tls_heap = NULL;
-static pthread_once_t memento_tls_once = PTHREAD_ONCE_INIT;
-static pthread_key_t memento_tls_key;  /* For destructor on thread exit */
 
-static void memento_tls_destructor(void* ptr) {
-    /* Clean up thread heap on thread exit */
-    memento_thread_heap_t* heap = (memento_thread_heap_t*)ptr;
-    if (heap) {
-        /* Flush any pending foreign frees */
-        memento_thread_heap_flush(heap);
-        /* Free the heap structure itself */
-        MEMENTO_FREE(heap, sizeof(memento_thread_heap_t));
-    }
-}
-
-static void memento_tls_init_once(void) {
-    pthread_key_create(&memento_tls_key, memento_tls_destructor);
-}
+/* Global heap registry: every heap ever created, so shutdown can reclaim
+ * retired heaps (and any foreign frees parked on them). Cold path only. */
+static pthread_mutex_t memento_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+static memento_thread_heap_t* memento_heap_registry = NULL;
+static pthread_key_t memento_tls_key;
+static bool memento_tls_key_created = false;
 
 static uint64_t memento_get_thread_id(void) {
 #if defined(__linux__)
@@ -590,46 +462,38 @@ static uint64_t memento_get_thread_id(void) {
 }
 
 static void memento_heap_init(memento_thread_heap_t* heap) {
-    memset(heap, 0, sizeof(memento_thread_heap_t));
-    
-    /* Initialize size class cache limits */
+    memset((void*)heap, 0, sizeof(memento_thread_heap_t));
+
     for (int i = 0; i < MEMENTO_SIZE_CLASS_COUNT; i++) {
-        /* Larger caches for smaller size classes */
-        if (memento_size_classes[i] <= 128) {
-            heap->caches[i].limit = 128;
-        } else if (memento_size_classes[i] <= 512) {
-            heap->caches[i].limit = 64;
-        } else if (memento_size_classes[i] <= 2048) {
-            heap->caches[i].limit = 32;
-        } else {
-            heap->caches[i].limit = 16;
-        }
+        heap->caches[i].limit = 64; /* Max 64 items per size class */
     }
-    
+
     heap->thread_id = memento_get_thread_id();
     heap->initialized = 1;
 }
 
-static void memento_tls_init_heap(void) {
-    if (MEMENTO_UNLIKELY(memento_tls_heap == NULL)) {
-        memento_tls_heap = (memento_thread_heap_t*)MEMENTO_MALLOC(sizeof(memento_thread_heap_t));
-        if (memento_tls_heap) {
-            memento_heap_init(memento_tls_heap);
-            pthread_setspecific(memento_tls_key, memento_tls_heap);
-        }
-    }
+static void memento_heap_register(memento_thread_heap_t* heap) {
+    pthread_mutex_lock(&memento_registry_lock);
+    heap->registry_next = memento_heap_registry;
+    memento_heap_registry = heap;
+    pthread_mutex_unlock(&memento_registry_lock);
 }
 
-/* Get or create thread-local heap - race-free initialization */
+/* Get or create thread-local heap */
 memento_thread_heap_t* memento_thread_heap_get(void) {
-    /* Fast path: already initialized */
-    if (MEMENTO_LIKELY(memento_tls_heap != NULL)) {
-        return memento_tls_heap;
+    if (MEMENTO_UNLIKELY(memento_tls_heap == NULL)) {
+        memento_thread_heap_t* heap =
+            (memento_thread_heap_t*)MEMENTO_MALLOC(sizeof(memento_thread_heap_t));
+        if (!heap) return NULL;
+        memento_heap_init(heap);
+        memento_heap_register(heap);
+        /* Arrange for the heap to be flushed and retired on thread exit.
+         * (No destructor for the main thread: memento_shutdown handles it.) */
+        if (memento_tls_key_created) {
+            pthread_setspecific(memento_tls_key, heap);
+        }
+        memento_tls_heap = heap;
     }
-    
-    /* Slow path: initialize once */
-    pthread_once(&memento_tls_once, memento_tls_init_once);
-    memento_tls_init_heap();
     return memento_tls_heap;
 }
 
@@ -637,396 +501,181 @@ memento_thread_heap_t* memento_thread_heap_get(void) {
  * Cache Operations - Non-locking
  * ============================================================================ */
 
-static MEMENTO_FORCE_INLINE void* memento_cache_pop(memento_size_class_cache_t* cache) {
-    void* ptr = cache->head;
-    if (MEMENTO_LIKELY(ptr != NULL)) {
-        cache->head = *(void**)ptr;
+MEMENTO_FORCE_INLINE void* memento_cache_pop(memento_size_class_cache_t* cache) {
+    memento_cache_node_t* node = cache->head;
+    if (MEMENTO_LIKELY(node != NULL)) {
+        cache->head = node->next;
         cache->count--;
-        return ptr;
+        return node;
     }
     return NULL;
 }
 
-static MEMENTO_FORCE_INLINE bool memento_cache_push(memento_size_class_cache_t* cache, void* ptr) {
-    if (MEMENTO_UNLIKELY(cache->count >= cache->limit)) {
+MEMENTO_FORCE_INLINE bool memento_cache_push(memento_size_class_cache_t* cache, void* ptr) {
+    if (cache->count >= cache->limit) {
         return false; /* Cache full */
     }
-    *(void**)ptr = cache->head;
-    cache->head = ptr;
+    memento_cache_node_t* node = (memento_cache_node_t*)ptr;
+    node->next = cache->head;
+    cache->head = node;
     cache->count++;
     return true;
 }
 
 /* ============================================================================
- * Foreign Deallocation - SPSC Ring Buffer with Proper Memory Ordering
+ * Foreign Deallocation - Intrusive MPSC Treiber Stack
+ *
+ * A foreign free writes {next, size} into the freed block itself and
+ * CAS-pushes it (release). The owner exchange-drains the whole stack
+ * (acquire) and frees each entry locally with its exact size. Unbounded,
+ * zero per-allocation overhead, no head/tail index races.
  * ============================================================================ */
 
-static bool memento_foreign_push(memento_thread_heap_t* heap, void* ptr, size_t size) {
-    /* Load head with acquire to see all prior writes by owner thread */
-    uint32_t head = MEMENTO_ATOMIC_LOAD_ACQ(&heap->foreign.head);
-    uint32_t next = (head + 1) & MEMENTO_FOREIGN_MASK;
-    
-    /* Check if ring is full (tail catches up to head) */
-    if (MEMENTO_UNLIKELY(next == MEMENTO_ATOMIC_LOAD_ACQ(&heap->foreign.tail))) {
-        return false; /* Ring full */
-    }
-    
-    /* Write entry */
-    heap->foreign.buffer[head].ptr = ptr;
-    heap->foreign.buffer[head].size = size;
-    
-    /* Publish with release - ensures entry is visible before head update */
-    MEMENTO_ATOMIC_STORE_REL(&heap->foreign.head, next);
-    return true;
+static void memento_foreign_push(memento_thread_heap_t* heap, void* ptr, size_t size) {
+    memento_foreign_node_t* node = (memento_foreign_node_t*)ptr;
+    node->size = size;
+    void* head = memento_atomic_ptr_load_relaxed(&heap->foreign_head);
+    do {
+        node->next = (memento_foreign_node_t*)head;
+    } while (!memento_atomic_ptr_cas_release(&heap->foreign_head, head, (void*)node));
 }
 
-static bool memento_foreign_pop(memento_thread_heap_t* heap, void** ptr, size_t* size) {
-    /* Load head with acquire to see all prior writes by other threads */
-    uint32_t head = MEMENTO_ATOMIC_LOAD_ACQ(&heap->foreign.head);
-    uint32_t tail = heap->foreign.tail;
-    
-    if (MEMENTO_UNLIKELY(head == tail)) {
-        return false; /* Ring empty */
-    }
-    
-    /* Read entry */
-    *ptr = heap->foreign.buffer[tail].ptr;
-    *size = heap->foreign.buffer[tail].size;
-    
-    /* Update tail (only owner thread writes - no atomic needed but use for consistency) */
-    heap->foreign.tail = (tail + 1) & MEMENTO_FOREIGN_MASK;
-    return true;
-}
+/* Forward decl: local free that skips the ownership check (used by flush and
+ * by shutdown, which drains retired heaps from a different thread). */
+static void memento_heap_free_local(memento_thread_heap_t* heap, void* ptr, size_t size);
 
 void memento_thread_heap_flush(memento_thread_heap_t* heap) {
-    /* Batch foreign frees for better cache locality */
-    void* ptr;
-    size_t size;
-    
-    /* Simple version: process one at a time */
-    /* TODO: Batch up to 64 items and sort by size class */
-    while (memento_foreign_pop(heap, &ptr, &size)) {
-        memento_thread_heap_free(heap, ptr, size);
+    if (MEMENTO_UNLIKELY(heap == NULL)) return;
+    if (MEMENTO_LIKELY(memento_atomic_ptr_load_relaxed(&heap->foreign_head) == NULL)) return;
+
+    memento_foreign_node_t* node =
+        (memento_foreign_node_t*)memento_atomic_ptr_exchange_acq(&heap->foreign_head, NULL);
+    while (node) {
+        memento_foreign_node_t* next = node->next;
+        size_t size = node->size;
+        memento_heap_free_local(heap, node, size);
         heap->stats.foreign_free_count++;
+        node = next;
     }
 }
 
 /* ============================================================================
- * Large Object Cache Operations
+ * Allocation from System
  * ============================================================================ */
-
-static void* memento_large_cache_alloc(memento_thread_heap_t* heap, size_t size) {
-    memento_large_cache_t* cache = &heap->large_cache;
-    
-    /* Look for exact size match */
-    for (uint32_t i = 0; i < cache->count; i++) {
-        if (cache->entries[i].size == size) {
-            void* ptr = cache->entries[i].ptr;
-            /* Remove from cache by swapping with last */
-            cache->count--;
-            if (i < cache->count) {
-                cache->entries[i] = cache->entries[cache->count];
-            }
-            return ptr;
-        }
-    }
-    return NULL;
-}
-
-static bool memento_large_cache_free(memento_thread_heap_t* heap, void* ptr, size_t size) {
-    memento_large_cache_t* cache = &heap->large_cache;
-    
-    if (MEMENTO_UNLIKELY(cache->count >= MEMENTO_LARGE_CACHE_SIZE)) {
-        return false; /* Cache full */
-    }
-    
-    cache->entries[cache->count].ptr = ptr;
-    cache->entries[cache->count].size = size;
-    cache->count++;
-    return true;
-}
-
-static void memento_large_cache_flush(memento_thread_heap_t* heap) {
-    memento_large_cache_t* cache = &heap->large_cache;
-    
-    for (uint32_t i = 0; i < cache->count; i++) {
-        MEMENTO_MUNMAP(cache->entries[i].ptr, cache->entries[i].size);
-    }
-    cache->count = 0;
-}
-
-/* ============================================================================
- * Arena Management for System Allocation
- * ============================================================================ */
-
-typedef struct memento_sys_arena_block_s {
-    struct memento_sys_arena_block_s* next;
-    char* current;
-    char* end;
-    char data[];
-} memento_sys_arena_block_t;
-
-typedef struct {
-    memento_sys_arena_block_t* current;
-    memento_sys_arena_block_t* blocks;
-    size_t block_count;
-} memento_arena_manager_t;
-
-static memento_arena_manager_t memento_global_arena_manager;
-static pthread_mutex_t memento_arena_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static void* memento_alloc_from_arena(size_t size) {
-    /* Round up to alignment */
-    size = memento_align_up(size, sizeof(void*));
-    
-    pthread_mutex_lock(&memento_arena_mutex);
-    
-    memento_sys_arena_block_t* block = memento_global_arena_manager.current;
-    
-    if (block && (size_t)(block->end - block->current) >= size) {
-        void* ptr = block->current;
-        block->current += size;
-        pthread_mutex_unlock(&memento_arena_mutex);
-        return ptr;
-    }
-    
-    /* Need new arena block */
-    size_t block_size = MEMENTO_ARENA_SIZE;
-    if (size > block_size - sizeof(memento_sys_arena_block_t)) {
-        block_size = size + sizeof(memento_sys_arena_block_t);
-    }
-    
-    memento_sys_arena_block_t* new_block = (memento_sys_arena_block_t*)MEMENTO_MMAP(block_size);
-    if (MEMENTO_UNLIKELY(new_block == MAP_FAILED)) {
-        pthread_mutex_unlock(&memento_arena_mutex);
-        return NULL;
-    }
-    
-    /* Hint for transparent huge pages */
-#if defined(MADV_HUGEPAGE)
-    madvise(new_block, block_size, MADV_HUGEPAGE);
-#endif
-    
-    new_block->next = memento_global_arena_manager.blocks;
-    new_block->current = new_block->data + size;
-    new_block->end = (char*)new_block + block_size;
-    
-    memento_global_arena_manager.blocks = new_block;
-    memento_global_arena_manager.current = new_block;
-    memento_global_arena_manager.block_count++;
-    
-    void* ptr = new_block->data;
-    pthread_mutex_unlock(&memento_arena_mutex);
-    return ptr;
-}
 
 static void* memento_alloc_from_system(size_t size) {
-    /* Use arena for small allocations, mmap for large */
+    /* Use mmap for large allocations, malloc for small */
     if (size >= 64 * 1024) {
         size = memento_align_up(size, 4096);
-        void* ptr = MEMENTO_MMAP(size);
-        if (ptr != MAP_FAILED) {
-#if defined(MADV_HUGEPAGE)
-            madvise(ptr, size, MADV_HUGEPAGE);
-#endif
-        }
-        return (ptr != MAP_FAILED) ? ptr : NULL;
+        return MEMENTO_MMAP(size);
     }
-    return memento_alloc_from_arena(size);
+    return MEMENTO_MALLOC(size);
 }
 
 static void memento_free_to_system(void* ptr, size_t size) {
-    /* Note: Arena blocks are not freed individually - reclaimed on shutdown */
     if (size >= 64 * 1024) {
         size = memento_align_up(size, 4096);
         MEMENTO_MUNMAP(ptr, size);
+    } else {
+        MEMENTO_FREE(ptr, size);
     }
-    /* Small allocations from arena are not freed - this is a design tradeoff for speed */
 }
 
 /* ============================================================================
- * Fast and Slow Allocation Paths
+ * Thread Heap Allocation
  * ============================================================================ */
 
-/* Forward declaration */
-static MEMENTO_NOINLINE void* memento_slow_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap, size_t size);
-
-/* Slow allocation path - for cache misses and large allocations */
-static MEMENTO_NOINLINE void* memento_slow_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap, size_t size) {
-    if (MEMENTO_UNLIKELY(size == 0)) {
+void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size) {
+    if (MEMENTO_UNLIKELY(heap == NULL || size == 0)) {
         return NULL;
     }
     
-    /* Large allocation (> 8KB) */
-    if (MEMENTO_UNLIKELY(size > MEMENTO_SMALL_MAX)) {
-        /* Try large object cache first */
-        size_t total_size = size + sizeof(size_t);
-        void* ptr = memento_large_cache_alloc(heap, total_size);
-        if (ptr) {
-            *(size_t*)ptr = size;
+    /* Check for size classes */
+    if (size <= 8192) {
+        size_t sc = memento_size_class_for(size);
+        size_t actual_size = memento_size_class_to_size(sc);
+        
+        /* Try thread-local cache first */
+        void* ptr = memento_cache_pop(&heap->caches[sc]);
+        if (MEMENTO_LIKELY(ptr != NULL)) {
             heap->stats.alloc_count++;
-            heap->stats.bytes_allocated += size;
-            return (char*)ptr + sizeof(size_t);
+            return ptr;
         }
         
         /* Allocate from system */
-        ptr = memento_alloc_from_system(total_size);
-        if (MEMENTO_UNLIKELY(ptr == NULL)) {
-            return NULL;
+        ptr = memento_alloc_from_system(actual_size);
+        if (ptr) {
+            heap->stats.alloc_count++;
+            heap->stats.bytes_allocated += actual_size;
         }
-        
+        return ptr;
+    }
+    
+    /* Large allocation - direct from system with size header for foreign free */
+    size_t total_size = size + sizeof(size_t);
+    void* ptr = memento_alloc_from_system(total_size);
+    if (ptr) {
         *(size_t*)ptr = size;
         heap->stats.alloc_count++;
         heap->stats.bytes_allocated += size;
         return (char*)ptr + sizeof(size_t);
     }
-    
-    /* Small allocation - size class */
-    size_t sc = memento_size_class_for(size);
-    size_t actual_size = memento_size_class_to_size(sc);
-    
-    /* Flush any foreign frees first (may give us memory back) */
-    memento_thread_heap_flush(heap);
-    
-    /* Allocate from system */
-    void* ptr = memento_alloc_from_system(actual_size);
-    if (MEMENTO_UNLIKELY(ptr == NULL)) {
-        return NULL;
-    }
-    
-    heap->stats.alloc_count++;
-    heap->stats.bytes_allocated += actual_size;
-    return ptr;
+    return NULL;
 }
 
-/* Fast allocation path - inline hot path */
-static MEMENTO_FORCE_INLINE void* memento_fast_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap, size_t size) {
-    if (MEMENTO_LIKELY(size <= MEMENTO_SMALL_MAX)) {
+/* Local free path: caller guarantees it is safe to touch the heap's caches
+ * (owning thread, or shutdown draining a retired heap after all threads
+ * were joined). */
+static void memento_heap_free_local(memento_thread_heap_t* heap, void* ptr, size_t size) {
+    /* Try to cache small blocks */
+    if (size <= 8192) {
         size_t sc = memento_size_class_for(size);
-        memento_size_class_cache_t* MEMENTO_RESTRICT cache = &heap->caches[sc];
-        void* MEMENTO_RESTRICT ptr = cache->head;
-        
-        if (MEMENTO_LIKELY(ptr != NULL)) {
-            cache->head = *(void**)ptr;
-            cache->count--;
-            heap->stats.alloc_count++;
-            /* Prefetch next item for future allocation */
-            __builtin_prefetch(cache->head, 0, 1);
-            return ptr;
-        }
-    }
-    return memento_slow_alloc(heap, size);
-}
-
-/* Public API: allocate from thread-local heap */
-void* memento_thread_heap_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap, size_t size) {
-    if (MEMENTO_UNLIKELY(heap == NULL)) {
-        return NULL;
-    }
-    return memento_fast_alloc(heap, size);
-}
-
-/* Public API: free to thread-local heap */
-void memento_thread_heap_free(memento_thread_heap_t* MEMENTO_RESTRICT heap, void* MEMENTO_RESTRICT ptr, size_t size) {
-    if (MEMENTO_UNLIKELY(ptr == NULL || heap == NULL)) {
-        return;
-    }
-    
-    /* Large allocation handling */
-    if (MEMENTO_UNLIKELY(size > MEMENTO_SMALL_MAX)) {
-        void* original_ptr = (char*)ptr - sizeof(size_t);
-        size_t total_size = size + sizeof(size_t);
-        
-        /* Check if this is a foreign free */
-        uint64_t current_thread_id = heap->thread_id;  /* Use cached thread ID */
-        if (MEMENTO_UNLIKELY(memento_get_thread_id() != current_thread_id)) {
-            if (memento_foreign_push(heap, ptr, size)) {
-                return;
-            }
-            /* Ring full - flush and retry */
-            memento_thread_heap_flush(heap);
-            memento_foreign_push(heap, ptr, size);
-            return;
-        }
-        
-        /* Try to cache in large object cache */
-        if (memento_large_cache_free(heap, original_ptr, total_size)) {
+        if (memento_cache_push(&heap->caches[sc], ptr)) {
             heap->stats.free_count++;
             return;
         }
-        
-        /* Flush cache and free */
-        memento_large_cache_flush(heap);
-        memento_free_to_system(original_ptr, total_size);
-        heap->stats.free_count++;
-        heap->stats.bytes_freed += size;
-        return;
+        memento_free_to_system(ptr, memento_size_class_to_size(sc));
+    } else {
+        /* Large allocation: the size header sits before the user pointer */
+        memento_free_to_system((char*)ptr - sizeof(size_t), size + sizeof(size_t));
     }
-    
-    /* Check if this is a foreign free (different thread) */
-    uint64_t current_thread_id = heap->thread_id;
-    if (MEMENTO_UNLIKELY(memento_get_thread_id() != current_thread_id)) {
-        if (memento_foreign_push(heap, ptr, size)) {
-            return;
-        }
-        /* Ring full - flush and retry */
-        memento_thread_heap_flush(heap);
-        memento_foreign_push(heap, ptr, size);
-        return;
-    }
-    
-    /* Local free - try to cache it */
-    size_t sc = memento_size_class_for(size);
-    if (memento_cache_push(&heap->caches[sc], ptr)) {
-        heap->stats.free_count++;
-        return;
-    }
-    
-    /* Cache full - return to system */
-    memento_free_to_system(ptr, memento_size_class_to_size(sc));
     heap->stats.free_count++;
     heap->stats.bytes_freed += size;
 }
 
-/* Public API: realloc with proper size class handling */
-void* memento_thread_heap_realloc(memento_thread_heap_t* MEMENTO_RESTRICT heap, void* MEMENTO_RESTRICT ptr,
+void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size) {
+    if (MEMENTO_UNLIKELY(ptr == NULL || heap == NULL)) {
+        return;
+    }
+
+    /* Foreign free (any thread other than the owner): push the block itself
+     * onto the heap's MPSC stack; the owner reclaims it in flush. The block
+     * is always big enough for the node (min size class 32B; large blocks
+     * trivially so). */
+    if (MEMENTO_UNLIKELY(heap != memento_tls_heap)) {
+        memento_foreign_push(heap, ptr, size);
+        return;
+    }
+
+    memento_heap_free_local(heap, ptr, size);
+}
+
+void* memento_thread_heap_realloc(memento_thread_heap_t* heap, void* ptr,
                                    size_t old_size, size_t new_size) {
-    if (MEMENTO_UNLIKELY(ptr == NULL)) {
+    if (ptr == NULL) {
         return memento_thread_heap_alloc(heap, new_size);
     }
-    
-    if (MEMENTO_UNLIKELY(new_size == 0)) {
+    if (new_size == 0) {
         memento_thread_heap_free(heap, ptr, old_size);
         return NULL;
     }
     
-    /* Check if we can reuse the same size class */
-    size_t old_sc = memento_size_class_for(old_size);
-    size_t new_sc = memento_size_class_for(new_size);
-    
-    if (old_sc == new_sc && old_size <= MEMENTO_SMALL_MAX && new_size <= MEMENTO_SMALL_MAX) {
-        /* Same size class - no need to reallocate */
-        return ptr;
-    }
-    
-    /* Allocate new block */
     void* new_ptr = memento_thread_heap_alloc(heap, new_size);
-    if (MEMENTO_UNLIKELY(new_ptr == NULL)) {
-        return NULL;
+    if (new_ptr) {
+        size_t copy_size = (old_size < new_size) ? old_size : new_size;
+        memcpy(new_ptr, ptr, copy_size);
+        memento_thread_heap_free(heap, ptr, old_size);
     }
-    
-    /* Copy data */
-    size_t old_usable = memento_size_class_to_size(old_sc);
-    size_t new_usable = memento_size_class_to_size(new_sc);
-    size_t copy_size = (old_usable < new_usable) ? old_usable : new_usable;
-    if (old_size < copy_size) {
-        copy_size = old_size;
-    }
-    memcpy(new_ptr, ptr, copy_size);
-    
-    /* Free old block */
-    memento_thread_heap_free(heap, ptr, old_size);
-    
     return new_ptr;
 }
 
@@ -1042,31 +691,73 @@ void memento_thread_heap_stats(memento_thread_heap_t* heap, memento_heap_stats_t
 
 static bool memento_initialized = false;
 
+/* Return every cached block to the system (owner thread or shutdown only) */
+static void memento_heap_release_caches(memento_thread_heap_t* heap) {
+    for (int i = 0; i < MEMENTO_SIZE_CLASS_COUNT; i++) {
+        void* ptr;
+        while ((ptr = memento_cache_pop(&heap->caches[i])) != NULL) {
+            memento_free_to_system(ptr, memento_size_class_to_size((size_t)i));
+        }
+    }
+}
+
+/* pthread TLS destructor: runs on thread exit (not for the main thread).
+ * Drain what we can and mark the heap retired; the struct itself must stay
+ * alive because other threads may still push foreign frees to it. It is
+ * reclaimed by memento_shutdown. */
+static void memento_thread_exit_destructor(void* arg) {
+    memento_thread_heap_t* heap = (memento_thread_heap_t*)arg;
+    if (!heap) return;
+    memento_thread_heap_flush(heap);
+    memento_heap_release_caches(heap);
+    heap->retired = 1;
+    memento_tls_heap = NULL;
+}
+
 bool memento_init(void) {
     if (memento_initialized) {
         return true;
     }
-    
-    pthread_once(&memento_tls_once, memento_tls_init_once);
+    if (!memento_tls_key_created) {
+        if (pthread_key_create(&memento_tls_key, memento_thread_exit_destructor) == 0) {
+            memento_tls_key_created = true;
+        }
+    }
     memento_initialized = true;
     return true;
 }
 
+/* Reclaim every heap in the registry. Contract: no other thread may touch
+ * memento after this begins (join threads first) - then draining foreign
+ * stacks from this thread is race-free. */
 void memento_shutdown(void) {
-    /* Flush all thread heaps */
-    /* Note: We can't easily iterate all thread heaps without tracking them */
-    /* The TLS destructor will handle per-thread cleanup */
-    
-    /* Free global arena blocks */
-    pthread_mutex_lock(&memento_arena_mutex);
-    memento_sys_arena_block_t* block = memento_global_arena_manager.blocks;
-    while (block) {
-        memento_sys_arena_block_t* next = block->next;
-        /* TODO: track block sizes for proper munmap */
-        block = next;
+    if (!memento_initialized) return;
+
+    pthread_mutex_lock(&memento_registry_lock);
+    memento_thread_heap_t* heap = memento_heap_registry;
+    memento_heap_registry = NULL;
+    pthread_mutex_unlock(&memento_registry_lock);
+
+    while (heap) {
+        memento_thread_heap_t* next = heap->registry_next;
+        /* Drain any parked foreign frees, then release caches. Safe from this
+         * thread by the shutdown contract. */
+        memento_foreign_node_t* node =
+            (memento_foreign_node_t*)memento_atomic_ptr_exchange_acq(&heap->foreign_head, NULL);
+        while (node) {
+            memento_foreign_node_t* n2 = node->next;
+            memento_heap_free_local(heap, node, node->size);
+            node = n2;
+        }
+        memento_heap_release_caches(heap);
+        if (heap == memento_tls_heap) {
+            memento_tls_heap = NULL;
+            if (memento_tls_key_created) pthread_setspecific(memento_tls_key, NULL);
+        }
+        MEMENTO_FREE(heap, sizeof(memento_thread_heap_t));
+        heap = next;
     }
-    pthread_mutex_unlock(&memento_arena_mutex);
-    
+
     memento_initialized = false;
 }
 
@@ -1084,8 +775,7 @@ struct memento_pool_s {
     size_t capacity;
     size_t count;
     memento_thread_heap_t* heap;
-    void* first_block;   /* Head of blocks list for cleanup */
-    void* current_block; /* Most recently allocated block */
+    void* blocks;  /* Linked list of allocated blocks for cleanup */
 };
 
 memento_pool_t* memento_pool_create(size_t object_size, size_t capacity,
@@ -1099,11 +789,10 @@ memento_pool_t* memento_pool_create(size_t object_size, size_t capacity,
     
     pool->object_size = object_size;
     pool->capacity = capacity;
-    pool->count = 0;
+    pool->count = capacity;   /* number of objects currently available */
     pool->heap = heap ? heap : memento_thread_heap_get();
     pool->free_list = NULL;
-    pool->first_block = NULL;
-    pool->current_block = NULL;
+    pool->blocks = NULL;
     
     /* Pre-allocate objects */
     size_t block_size = object_size * capacity;
@@ -1113,28 +802,23 @@ memento_pool_t* memento_pool_create(size_t object_size, size_t capacity,
         return NULL;
     }
     
-    pool->first_block = block;
-    pool->current_block = block;
-    
     /* Build free list */
     for (size_t i = 0; i < capacity; i++) {
         memento_pool_chunk_t* chunk = (memento_pool_chunk_t*)((char*)block + i * object_size);
         chunk->next = pool->free_list;
         pool->free_list = chunk;
     }
-    
+    pool->blocks = block;
+
     return pool;
 }
 
 void memento_pool_destroy(memento_pool_t* pool) {
     if (!pool) return;
-    
-    /* Free all blocks back to thread heap */
-    /* Currently we only track the first block - free it */
-    if (pool->first_block) {
-        memento_thread_heap_free(pool->heap, pool->first_block, pool->object_size * pool->capacity);
+    if (pool->blocks) {
+        memento_thread_heap_free(pool->heap, pool->blocks,
+                                 pool->object_size * pool->capacity);
     }
-    
     MEMENTO_FREE(pool, sizeof(memento_pool_t));
 }
 
@@ -1259,7 +943,6 @@ memento_arena_save_t memento_arena_save(memento_arena_t* arena) {
     memento_arena_save_t save;
     save.saved_top = arena->top;
     save.saved_used = arena->used;
-    save.saved_block = arena->current;
     return save;
 }
 
@@ -1267,35 +950,11 @@ void memento_arena_restore(memento_arena_t* arena, memento_arena_save_t* save) {
     if (!arena || !save) return;
     arena->top = save->saved_top;
     arena->used = save->saved_used;
-    arena->current = (memento_arena_block_t*)save->saved_block;
-    arena->capacity = arena->current->size;
 }
 
 void memento_arena_reset(memento_arena_t* arena) {
     if (!arena) return;
-    
-    /* Free all blocks back to thread heap */
-    memento_arena_block_t* block = arena->blocks;
-    while (block) {
-        memento_arena_block_t* next = block->next;
-        memento_thread_heap_free(arena->heap, block, sizeof(memento_arena_block_t) + block->size);
-        block = next;
-    }
-    
-    /* Reallocate initial block */
-    size_t block_size = sizeof(memento_arena_block_t) + arena->initial_capacity;
-    arena->current = (memento_arena_block_t*)memento_thread_heap_alloc(arena->heap, block_size);
-    if (arena->current) {
-        arena->current->next = NULL;
-        arena->current->size = arena->initial_capacity;
-        arena->blocks = arena->current;
-        arena->capacity = arena->initial_capacity;
-    } else {
-        arena->blocks = NULL;
-        arena->capacity = 0;
-    }
-    
-    arena->top = arena->current ? arena->current->data : NULL;
+    arena->top = arena->current->data;
     arena->used = 0;
 }
 
@@ -1312,10 +971,8 @@ size_t memento_arena_capacity(const memento_arena_t* arena) {
  * ============================================================================ */
 
 struct memento_stack_s {
-    char* buffer;           /* Aligned buffer pointer */
-    char* original_buffer;  /* Original allocation for freeing */
+    char* buffer;
     size_t capacity;
-    size_t allocated_size;  /* Actual allocation size */
     size_t top;
     memento_thread_heap_t* heap;
 };
@@ -1325,31 +982,21 @@ memento_stack_t* memento_stack_create(size_t capacity, memento_thread_heap_t* he
     if (!stack) return NULL;
     
     stack->heap = heap ? heap : memento_thread_heap_get();
-    
-    /* Over-allocate to ensure maximum alignment */
-    size_t alignment = 64;  /* Maximum alignment we might need */
-    size_t alloc_size = capacity + alignment;
-    char* original = (char*)memento_thread_heap_alloc(stack->heap, alloc_size);
-    if (!original) {
+    stack->buffer = (char*)memento_thread_heap_alloc(stack->heap, capacity);
+    if (!stack->buffer) {
         MEMENTO_FREE(stack, sizeof(memento_stack_t));
         return NULL;
     }
     
-    /* Align the buffer */
-    uintptr_t aligned = ((uintptr_t)original + alignment - 1) & ~(alignment - 1);
-    
-    stack->original_buffer = original;
-    stack->buffer = (char*)aligned;
     stack->capacity = capacity;
-    stack->allocated_size = alloc_size;
     stack->top = 0;
     return stack;
 }
 
 void memento_stack_destroy(memento_stack_t* stack) {
     if (!stack) return;
-    if (stack->original_buffer) {
-        memento_thread_heap_free(stack->heap, stack->original_buffer, stack->allocated_size);
+    if (stack->buffer) {
+        memento_thread_heap_free(stack->heap, stack->buffer, stack->capacity);
     }
     MEMENTO_FREE(stack, sizeof(memento_stack_t));
 }
@@ -1413,15 +1060,7 @@ memento_slab_t* memento_slab_create(memento_thread_heap_t* heap) {
     for (int i = 0; i < MEMENTO_SIZE_CLASS_COUNT; i++) {
         slab->classes[i].cache.head = NULL;
         slab->classes[i].cache.count = 0;
-        if (memento_size_classes[i] <= 128) {
-            slab->classes[i].cache.limit = 128;
-        } else if (memento_size_classes[i] <= 512) {
-            slab->classes[i].cache.limit = 64;
-        } else if (memento_size_classes[i] <= 2048) {
-            slab->classes[i].cache.limit = 32;
-        } else {
-            slab->classes[i].cache.limit = 16;
-        }
+        slab->classes[i].cache.limit = 64;
         slab->classes[i].block_size = memento_size_class_to_size(i);
     }
     
@@ -1443,7 +1082,7 @@ void memento_slab_destroy(memento_slab_t* slab) {
 void* memento_slab_alloc(memento_slab_t* slab, size_t size) {
     if (!slab || size == 0) return NULL;
     
-    if (size > MEMENTO_SMALL_MAX) {
+    if (size > 8192) {
         /* Large allocation - bypass slab */
         return memento_thread_heap_alloc(slab->heap, size);
     }
@@ -1459,7 +1098,7 @@ void* memento_slab_alloc(memento_slab_t* slab, size_t size) {
 void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size) {
     if (!slab || !ptr) return;
     
-    if (size > MEMENTO_SMALL_MAX) {
+    if (size > 8192) {
         memento_thread_heap_free(slab->heap, ptr, size);
         return;
     }
@@ -1470,6 +1109,16 @@ void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size) {
     }
 }
 
+
+#ifdef __cplusplus
+  #if defined(__clang__)
+    #pragma clang diagnostic pop
+  #elif defined(__GNUC__)
+    #pragma GCC diagnostic pop
+  #endif
+#endif
+
 #endif /* MEMENTO_IMPLEMENTATION */
 
 #endif /* MEMENTO_H */
+
