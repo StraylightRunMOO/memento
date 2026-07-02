@@ -48,15 +48,15 @@ static int failed = 0;
 TEST(version_check) {
     /* Check version macros */
     ASSERT_EQ(MEMENTO_VERSION_MAJOR, 2);
-    ASSERT_EQ(MEMENTO_VERSION_MINOR, 0);
+    ASSERT_EQ(MEMENTO_VERSION_MINOR, 1);
     ASSERT_EQ(MEMENTO_VERSION_PATCH, 0);
     
     /* Check version string */
     ASSERT_NOT_NULL(memento_version_string());
-    ASSERT_EQ(strcmp(memento_version_string(), "2.0.0"), 0);
+    ASSERT_EQ(strcmp(memento_version_string(), "2.1.0"), 0);
     
     /* Check version number */
-    ASSERT_EQ(memento_version_number(), 0x020000);
+    ASSERT_EQ(memento_version_number(), 0x020100);
     
     /* Check version check function */
     ASSERT(memento_version_check(2, 0, 0));
@@ -115,13 +115,13 @@ TEST(align_down) {
 }
 
 TEST(size_classes) {
-    /* Test size class mapping */
-    ASSERT_EQ(memento_size_class_for(1), 0);
+    /* Test size class mapping - 24 size classes */
+    ASSERT_EQ(memento_size_class_for(1), 0);       /* 1-32 -> class 0 (32 bytes) */
     ASSERT_EQ(memento_size_class_for(32), 0);
-    ASSERT_EQ(memento_size_class_for(33), 1);
-    ASSERT_EQ(memento_size_class_for(64), 1);
-    ASSERT_EQ(memento_size_class_for(8192), 15);
-    ASSERT_EQ(memento_size_class_for(10000), 15);  /* Oversize maps to largest */
+    ASSERT_EQ(memento_size_class_for(33), 1);      /* 33-48 -> class 1 (48 bytes) */
+    ASSERT_EQ(memento_size_class_for(64), 2);      /* 49-64 -> class 2 (64 bytes) */
+    ASSERT_EQ(memento_size_class_for(8192), 23);   /* 4097-8192 -> class 23 (8192 bytes) */
+    ASSERT_EQ(memento_size_class_for(10000), 23);  /* Oversize maps to largest */
     
     /* Test round-trip */
     for (size_t sc = 0; sc < MEMENTO_SIZE_CLASS_COUNT; sc++) {
