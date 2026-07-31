@@ -4,7 +4,7 @@
 [![Standard](https://img.shields.io/badge/C-99-blue.svg)](https://en.wikipedia.org/wiki/C99)
 [![Standard](https://img.shields.io/badge/C++-17-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
 
-**Memento** is a high-performance, multi-strategy memory allocator library (version 2.0.0) designed for modern multi-threaded applications. It combines the best ideas from production allocators like **rpmalloc** and **mimalloc** with a focus on simplicity, performance, and flexibility.
+**Memento** is a high-performance, multi-strategy memory allocator library (version 2.2.0) designed for modern multi-threaded applications. It combines the best ideas from production allocators like **rpmalloc** and **mimalloc** with a focus on simplicity, performance, and flexibility.
 
 ## Key Features
 
@@ -395,6 +395,14 @@ MIT License - See [LICENSE](LICENSE) file
 - **nanobench** by Martin Leitner-Ankerl - Benchmarking library
 
 ## Version History
+
+### 2.2.0
+- Windows port (VirtualAlloc, FLS, CriticalSection, Interlocked)
+- Correctness fixes (MAP_FAILED, arena reset/save, stack alignment, C++ linkage)
+- 24 size classes, cache-line freelists, branchless LUT, fast_alloc
+- 2 MiB spans + large-object cache; foreign flush batch+sort
+- NUMA first-touch, THP madvise, ASan freelist poison, debug canaries
+- Portable CMake/tests and microbench
 
 ### 2.0.0 (2024)
 - Complete rewrite with non-locking design

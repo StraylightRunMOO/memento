@@ -1,3 +1,86 @@
+# Build trees
+build/
+build-*/
+cmake-build-*/
+out/
+Debug/
+Release/
+RelWithDebInfo/
+MinSizeRel/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+*.cmake
+!CMakeLists.txt
+
+# Compiled objects / libraries / binaries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.out
+*.app
+*.pdb
+*.ilk
+*.exp
+*.idb
+
+# Local test binaries (often built in-tree)
+/test_core
+/test_thread
+/test_cpp
+/example_simple
+/benchmark_suite
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+.clangd/
+.cache/
+
+# OS junk
 .DS_Store
-old
-build
+Thumbs.db
+Desktop.ini
+
+# Sanitizer / coverage / profiling
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+default.profraw
+asan.log*
+tsan.log*
+ubsan.log*
+
+# Package / install leftovers
+install_manifest.txt
+_CPack_Packages/
+*.tar.gz
+*.zip
+
+# FetchContent / dep build caches if created in-tree
+_deps/
+
+# Local scratch (not part of the library)
+old/
+local/
+*.local
+)

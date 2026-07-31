@@ -94,8 +94,8 @@ struct Particle {
 
 TEST(version_check) {
     /* Check C API version */
-    ASSERT_EQ(strcmp(memento_version_string(), "2.1.0"), 0);
-    ASSERT_EQ(memento_version_number(), 0x020100);
+    ASSERT_EQ(strcmp(memento_version_string(), "2.2.0"), 0);
+    ASSERT_EQ(memento_version_number(), 0x020200);
     ASSERT(memento_version_check(2, 1, 0));
     ASSERT(!memento_version_check(3, 0, 0));
 }

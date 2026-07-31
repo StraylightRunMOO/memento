@@ -48,15 +48,15 @@ static int failed = 0;
 TEST(version_check) {
     /* Check version macros */
     ASSERT_EQ(MEMENTO_VERSION_MAJOR, 2);
-    ASSERT_EQ(MEMENTO_VERSION_MINOR, 1);
+    ASSERT_EQ(MEMENTO_VERSION_MINOR, 2);
     ASSERT_EQ(MEMENTO_VERSION_PATCH, 0);
     
     /* Check version string */
     ASSERT_NOT_NULL(memento_version_string());
-    ASSERT_EQ(strcmp(memento_version_string(), "2.1.0"), 0);
+    ASSERT_EQ(strcmp(memento_version_string(), "2.2.0"), 0);
     
     /* Check version number */
-    ASSERT_EQ(memento_version_number(), 0x020100);
+    ASSERT_EQ(memento_version_number(), 0x020200);
     
     /* Check version check function */
     ASSERT(memento_version_check(2, 0, 0));
@@ -84,8 +84,8 @@ TEST(power_of_two) {
     ASSERT(memento_is_power_of_two(2));
     ASSERT(memento_is_power_of_two(64));
     ASSERT(memento_is_power_of_two(1024));
-    /* 0 is considered power of two by the bit trick, accept that */
-    ASSERT(memento_is_power_of_two(0));
+    /* 0 is not a power of two (would break align_up masks) */
+    ASSERT(!memento_is_power_of_two(0));
     ASSERT(!memento_is_power_of_two(3));
     ASSERT(!memento_is_power_of_two(63));
     ASSERT(!memento_is_power_of_two(100));
@@ -115,15 +115,24 @@ TEST(align_down) {
 }
 
 TEST(size_classes) {
-    /* Test size class mapping - 24 size classes */
-    ASSERT_EQ(memento_size_class_for(1), 0);       /* 1-32 -> class 0 (32 bytes) */
+    /* 24 size classes with fine grain in 32–512B */
+    ASSERT_EQ(MEMENTO_SIZE_CLASS_COUNT, 24);
+    ASSERT_EQ(memento_size_class_for(1), 0);       /* 1-32 -> class 0 (32B) */
     ASSERT_EQ(memento_size_class_for(32), 0);
-    ASSERT_EQ(memento_size_class_for(33), 1);      /* 33-48 -> class 1 (48 bytes) */
-    ASSERT_EQ(memento_size_class_for(64), 2);      /* 49-64 -> class 2 (64 bytes) */
-    ASSERT_EQ(memento_size_class_for(8192), 23);   /* 4097-8192 -> class 23 (8192 bytes) */
+    ASSERT_EQ(memento_size_class_for(33), 1);      /* 33-48 -> class 1 (48B) */
+    ASSERT_EQ(memento_size_class_for(48), 1);
+    ASSERT_EQ(memento_size_class_for(49), 2);      /* 49-64 -> class 2 (64B) */
+    ASSERT_EQ(memento_size_class_for(64), 2);
+    ASSERT_EQ(memento_size_class_for(80), 3);
+    ASSERT_EQ(memento_size_class_for(128), 6);
+    ASSERT_EQ(memento_size_class_for(256), 10);
+    ASSERT_EQ(memento_size_class_for(512), 14);
+    ASSERT_EQ(memento_size_class_for(2048), 21);
+    ASSERT_EQ(memento_size_class_for(4096), 22);
+    ASSERT_EQ(memento_size_class_for(8192), 23);
     ASSERT_EQ(memento_size_class_for(10000), 23);  /* Oversize maps to largest */
     
-    /* Test round-trip */
+    /* Test round-trip for every class boundary */
     for (size_t sc = 0; sc < MEMENTO_SIZE_CLASS_COUNT; sc++) {
         size_t size = memento_size_class_to_size(sc);
         size_t computed_sc = memento_size_class_for(size);
@@ -205,7 +214,7 @@ TEST(heap_mixed_sizes) {
 TEST(heap_large_allocation) {
     memento_thread_heap_t* heap = memento_thread_heap_get();
     
-    /* Allocations > 8KB go direct to system */
+    /* Allocations > 8KB go through large path (+ LOC) */
     size_t large_sizes[] = {8193, 16384, 32768, 65536, 131072, 1048576};
     
     for (size_t i = 0; i < sizeof(large_sizes)/sizeof(large_sizes[0]); i++) {
@@ -214,6 +223,51 @@ TEST(heap_large_allocation) {
         memset(ptr, 0xEF, large_sizes[i]);
         memento_thread_heap_free(heap, ptr, large_sizes[i]);
     }
+}
+
+TEST(heap_large_cache_reuse) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    const size_t sz = 16384;
+
+    void* a = memento_thread_heap_alloc(heap, sz);
+    ASSERT_NOT_NULL(a);
+    memento_thread_heap_free(heap, a, sz);
+
+    /* Exact-size free should hit the large-object cache */
+    void* b = memento_thread_heap_alloc(heap, sz);
+    ASSERT_NOT_NULL(b);
+    ASSERT_EQ(a, b);
+    memento_thread_heap_free(heap, b, sz);
+}
+
+TEST(heap_span_refill) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    /* Allocate more than freelist limit to force span refill */
+    enum { N = 200 };
+    void* ptrs[N];
+    for (int i = 0; i < N; i++) {
+        ptrs[i] = memento_thread_heap_alloc(heap, 128);
+        ASSERT_NOT_NULL(ptrs[i]);
+        memset(ptrs[i], (unsigned char)i, 128);
+    }
+    for (int i = 0; i < N; i++) {
+        memento_thread_heap_free(heap, ptrs[i], 128);
+    }
+    /* Reuse from cache / span freelist */
+    for (int i = 0; i < N; i++) {
+        ptrs[i] = memento_thread_heap_alloc(heap, 128);
+        ASSERT_NOT_NULL(ptrs[i]);
+        memento_thread_heap_free(heap, ptrs[i], 128);
+    }
+}
+
+TEST(heap_numa_node_query) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    ASSERT_NOT_NULL(heap);
+    /* -1 if NUMA disabled/unknown; otherwise non-negative node id */
+    int node = memento_thread_heap_numa_node(heap);
+    ASSERT(node >= -1);
+    ASSERT_EQ(memento_thread_heap_numa_node(NULL), -1);
 }
 
 TEST(heap_reuse) {
@@ -769,6 +823,9 @@ int main(void) {
     RUN_TEST(heap_all_size_classes);
     RUN_TEST(heap_mixed_sizes);
     RUN_TEST(heap_large_allocation);
+    RUN_TEST(heap_large_cache_reuse);
+    RUN_TEST(heap_span_refill);
+    RUN_TEST(heap_numa_node_query);
     RUN_TEST(heap_reuse);
     RUN_TEST(heap_realloc);
     
