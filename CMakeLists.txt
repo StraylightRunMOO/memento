@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(memento VERSION 2.2.0
+project(memento VERSION 2.2.1
     DESCRIPTION "High-performance non-locking memory allocator"
     LANGUAGES C CXX)
 

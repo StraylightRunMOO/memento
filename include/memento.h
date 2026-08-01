@@ -46,8 +46,8 @@
 /* Version macros for compile-time checking */
 #define MEMENTO_VERSION_MAJOR 2
 #define MEMENTO_VERSION_MINOR 2
-#define MEMENTO_VERSION_PATCH 0
-#define MEMENTO_VERSION_STRING "2.2.0"
+#define MEMENTO_VERSION_PATCH 1
+#define MEMENTO_VERSION_STRING "2.2.1"
 #define MEMENTO_VERSION ((MEMENTO_VERSION_MAJOR << 16) | \
                          (MEMENTO_VERSION_MINOR << 8) | \
                          MEMENTO_VERSION_PATCH)
@@ -714,8 +714,8 @@ static int memento_initialized = 0;
     #define MEMENTO_ASAN_POISON(p, n)   ASAN_POISON_MEMORY_REGION((p), (n))
     #define MEMENTO_ASAN_UNPOISON(p, n) ASAN_UNPOISON_MEMORY_REGION((p), (n))
 #else
-    #define MEMENTO_ASAN_POISON(p, n)   ((void)0)
-    #define MEMENTO_ASAN_UNPOISON(p, n) ((void)0)
+    #define MEMENTO_ASAN_POISON(p, n)   do { (void)(p); (void)(n); } while (0)
+    #define MEMENTO_ASAN_UNPOISON(p, n) do { (void)(p); (void)(n); } while (0)
 #endif
 
 #if MEMENTO_DEBUG
@@ -1345,11 +1345,15 @@ static void memento_heap_release_caches(memento_thread_heap_t* heap) {
     }
 }
 
+/* pthread/FLS TLS destructor: runs on thread exit (not for the main thread).
+ * Drain foreign frees that arrived while we were still "owner" and mark the
+ * heap retired. Do NOT release spans/caches here: live allocations may still
+ * be held by other threads and foreign-freed later (they write into the block
+ * itself for the MPSC node). Spans stay mapped until memento_shutdown. */
 static void memento_thread_exit_destructor(void* arg) {
     memento_thread_heap_t* heap = (memento_thread_heap_t*)arg;
     if (!heap) return;
     memento_thread_heap_flush(heap);
-    memento_heap_release_caches(heap);
     heap->retired = 1;
     memento_tls_heap = NULL;
 }
