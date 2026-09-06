@@ -56,6 +56,11 @@ target_compile_definitions(test_debug PRIVATE MEMENTO_DEBUG=1)
 target_link_libraries(test_debug PRIVATE Threads::Threads)
 add_test(NAME debug COMMAND test_debug)
 
+add_executable(test_bitmap test_bitmap.c)
+target_include_directories(test_bitmap PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_bitmap PRIVATE Threads::Threads)
+add_test(NAME bitmap COMMAND test_bitmap)
+
 # Stats-free build: MEMENTO_STATS=0 must compile and behave
 add_executable(test_nostats test_core.c)
 target_include_directories(test_nostats PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -73,13 +78,13 @@ add_test(NAME cpp COMMAND test_cpp)
 # MSVC: silence CRT secure warnings
 if(MSVC)
     foreach(t test_core test_thread test_sized test_sized_mode test_nostats test_proxy
-               test_proxy_release test_lifecycle test_debug test_cpp)
+               test_proxy_release test_lifecycle test_debug test_bitmap test_cpp)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     endforeach()
 endif()
 
 set_tests_properties(core thread sized sized_mode proxy proxy_release
-                     lifecycle debug cpp PROPERTIES
+                     lifecycle debug bitmap cpp PROPERTIES
     TIMEOUT 120
     ENVIRONMENT "MEMENTO_TEST=1"
 )

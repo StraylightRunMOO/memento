@@ -274,6 +274,7 @@ not vibes.
 | `MEMENTO_SPAN_SIZE` | 2 MiB | Span size; must be a power of two |
 | `MEMENTO_PAGE_SIZE` | 64 KiB | Pages inside each span; must divide span size |
 | `MEMENTO_TCACHE_DEPTH` | 16 | Per-class LIFO tcache slots (RSS vs churn) |
+| `MEMENTO_SIMD_AVX2` / `AVX512` / `NEON` | auto | Miss-path bitmap scan + packed tcache fill; compile-time only |
 | `MEMENTO_SIGNAL` | 1 | Shim: 0 = do not install SIGUSR1 |
 | `MEMENTO_SPAN_PURGE_MS` | 10 | How long an empty span keeps its pages |
 | `MEMENTO_SPAN_CACHE_MAX` | 16 | Backstop: parked spans past this discard eagerly |
