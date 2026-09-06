@@ -1776,7 +1776,14 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
         memento_span_t* s;
         for (s = heap->span_list; s; s = s->next) {
             if (s->reclaimed) continue;
+            /* syscall: madvise(2) is a BSD/GNU extension and is not declared
+             * under strict -std=c11 + _POSIX_C_SOURCE. The number 25 is the
+             * frozen Linux UAPI value (6.1+); older kernels return EINVAL. */
+#if defined(SYS_madvise)
+            (void)syscall(SYS_madvise, s, (size_t)MEMENTO_SPAN_SIZE, MADV_COLLAPSE);
+#elif defined(MADV_COLLAPSE)
             (void)madvise(s, MEMENTO_SPAN_SIZE, MADV_COLLAPSE);
+#endif
         }
     }
 #endif
@@ -2006,7 +2013,13 @@ static void* memento_va_bump(size_t size, size_t align) {
     if (align < 4096) align = 4096;
     MEMENTO_VA_LOCK();
     {
-        size_t off = memento_align_up(memento_va_off, align);
+        /* Align the resulting address, not the offset. The reservation
+         * base is not span-aligned, so align_up(off, 2 MiB) would skip
+         * the 2 MiB-aligned slot and hand out a misaligned span —
+         * memento_span_of's AND then lands in the PROT_NONE prefix. */
+        uintptr_t start = (uintptr_t)(memento_va_base + memento_va_off);
+        uintptr_t aligned = memento_align_up(start, align);
+        size_t off = (size_t)(aligned - (uintptr_t)memento_va_base);
         if (off + size > memento_va_cap) {
             MEMENTO_VA_UNLOCK();
             return NULL;
@@ -2303,15 +2316,29 @@ static void memento_span_purge_stale(memento_thread_heap_t* heap, uint64_t now) 
         if (s->reclaimed != 1) continue;
         if (s->purge_at > now && pos < MEMENTO_SPAN_CACHE_MAX) continue;
 #if MEMENTO_PLATFORM_POSIX
-        /* Keep the first page (span header) mapped; discard the rest. */
-        if (MEMENTO_SPAN_SIZE > 4096) {
-            memento_os_discard((char*)s + 4096, MEMENTO_SPAN_SIZE - 4096);
+        /* Keep the span header's page mapped; discard the rest.
+         * Must be OS-page aligned: on 64 KiB kernels, DONTNEED of
+         * [span+4K, ...) rounds the start down to span+0 and zeros the
+         * header. With MEMENTO_PAGE_SIZE the header owns page 0 (64 KiB). */
+        {
+#if MEMENTO_PAGE_SIZE
+            size_t keep = (size_t)MEMENTO_PAGE_SIZE;
+#else
+            size_t keep = 4096u;
+#endif
+            if (MEMENTO_SPAN_SIZE > keep) {
+                memento_os_discard((char*)s + keep, MEMENTO_SPAN_SIZE - keep);
+            }
         }
 #endif
         s->reclaimed = 2;
+#if MEMENTO_PAGE_SIZE
+        s->zero_from = 0; /* data pages (1..N) were discarded */
+#else
         s->zero_from = (MEMENTO_SPAN_SIZE > 4096 && MEMENTO_SPAN_HEADER < 4096)
             ? memento_align_up(4096 - MEMENTO_SPAN_HEADER, 16)
             : 0;
+#endif
         heap->stats.spans_reclaimed++;
     }
 }

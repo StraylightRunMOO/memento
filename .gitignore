@@ -83,4 +83,17 @@ _deps/
 old/
 local/
 *.local
+
+# Python
+__pycache__/
+*.py[cod]
+
+# mimalloc-bench clone and its build tree (see bench/run_mimalloc_bench.sh)
+extern/
+bench/shims/
+
+# Per-run raw logs and machine-local --external paths; captured CSVs and PNGs are kept
+bench/results/*.raw
+bench/results/raw/
+bench/results/external.allocs
 )

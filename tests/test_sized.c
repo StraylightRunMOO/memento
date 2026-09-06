@@ -67,6 +67,20 @@ TEST(malloc_free_small) {
     }
 }
 
+TEST(small_span_is_self_aligned) {
+    /* VA bump must hand out 2 MiB-aligned spans. A misaligned span makes
+     * memento_span_of AND into the PROT_NONE prefix and sized free SIGSEGVs. */
+    void* p = memento_malloc(64);
+    ASSERT_NOT_NULL(p);
+    uintptr_t raw = (uintptr_t)p - 16u;
+    uintptr_t span = raw & ~((uintptr_t)MEMENTO_SPAN_SIZE - 1u);
+    ASSERT_EQ(span, raw & ~((uintptr_t)MEMENTO_SPAN_SIZE - 1u));
+    volatile uintptr_t owner = *(volatile uintptr_t*)(span + 2u * sizeof(void*));
+    ASSERT_NE(owner, (uintptr_t)0);
+    (void)owner;
+    memento_free(p);
+}
+
 TEST(malloc_free_large_and_huge) {
     size_t sizes[] = { 9000, 16384, 100 * 1024, 250 * 1024, 300 * 1024,
                        1024 * 1024, 3 * 1024 * 1024 };
@@ -368,6 +382,7 @@ int main(void) {
     }
 
     RUN_TEST(malloc_free_small);
+    RUN_TEST(small_span_is_self_aligned);
     RUN_TEST(malloc_free_large_and_huge);
     RUN_TEST(calloc_zeroes);
     RUN_TEST(realloc_chains);

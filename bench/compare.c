@@ -36,8 +36,10 @@
  *    about the bulk-64B row.
  */
 
-#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-#define _POSIX_C_SOURCE 200809L
+#if !defined(_WIN32)
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #endif
 
 #include <stdio.h>
@@ -110,7 +112,7 @@ static void report(const char* name, double t0, double t1, long ops) {
 }
 
 /* hot alloc+free loop */
-static void bench_churn(size_t size, long iters) {
+static void bench_churn(const char* name, size_t size, long iters) {
     for (long i = 0; i < 1000; i++) al_free(al_alloc(size), size);
     double t0 = now_sec();
     for (long i = 0; i < iters; i++) {
@@ -118,22 +120,22 @@ static void bench_churn(size_t size, long iters) {
         asm volatile("" : : "r"(p) : "memory");
         al_free(p, size);
     }
-    report("churn", t0, now_sec(), iters);
+    report(name, t0, now_sec(), iters);
 }
 
 /* allocate everything, then free everything in reverse */
-static void bench_bulk(size_t size, long n) {
+static void bench_bulk(const char* name, size_t size, long n) {
     void** ptrs = (void**)malloc((size_t)n * sizeof(void*));
     for (long i = 0; i < 1000; i++) al_free(al_alloc(size), size);
     double t0 = now_sec();
     for (long i = 0; i < n; i++) ptrs[i] = al_alloc(size);
     for (long i = n - 1; i >= 0; i--) al_free(ptrs[i], size);
-    report("bulk", t0, now_sec(), n);
+    report(name, t0, now_sec(), n);
     free(ptrs);
 }
 
 /* mixed sizes 16..256, bulk pattern */
-static void bench_mixed(long n) {
+static void bench_mixed(const char* name, long n) {
     void** ptrs = (void**)malloc((size_t)n * sizeof(void*));
     size_t* sz = (size_t*)malloc((size_t)n * sizeof(size_t));
     unsigned rng = 42;
@@ -144,7 +146,7 @@ static void bench_mixed(long n) {
     double t0 = now_sec();
     for (long i = 0; i < n; i++) ptrs[i] = al_alloc(sz[i]);
     for (long i = n - 1; i >= 0; i--) al_free(ptrs[i], sz[i]);
-    report("mixed16-256", t0, now_sec(), n);
+    report(name, t0, now_sec(), n);
     free(sz);
     free(ptrs);
 }
@@ -163,20 +165,25 @@ static void* thread_churn(void* arg) {
     return NULL;
 }
 
-static void bench_threads(int nthreads, long iters_per) {
+static void bench_threads(const char* name, int nthreads, long iters_per) {
     pthread_t t[16];
     double t0 = now_sec();
     for (int i = 0; i < nthreads; i++)
         pthread_create(&t[i], NULL, thread_churn, (void*)(intptr_t)iters_per);
     for (int i = 0; i < nthreads; i++)
         pthread_join(t[i], NULL);
-    report("4-thread churn", t0, now_sec(), (long)nthreads * iters_per);
+    report(name, t0, now_sec(), (long)nthreads * iters_per);
 }
 
 int main(int argc, char** argv) {
     const char* who = "glibc";
 #if defined(ALLOC_MIMENTO3)
-    who = "memento-3.0"; memento_init();
+#if defined(MEMENTO_STATS) && !MEMENTO_STATS
+    who = "memento-3.0-nostats";
+#else
+    who = "memento-3.0";
+#endif
+    memento_init();
 #elif defined(ALLOC_MIMENTO221)
     who = "memento-2.2.1"; memento_init();
 #elif defined(ALLOC_MIMALLOC)
@@ -189,21 +196,13 @@ int main(int argc, char** argv) {
     al_setup_thread();
 
     printf("[%s]\n", who);
-    bench_churn(64, 2000000 / k);
-    bench_churn(1024, 1000000 / k);
-    bench_bulk(64, 100000 / k);
-    bench_bulk(4096, 20000 / k);
-    bench_mixed(50000 / k);
-    bench_churn_large:;
-    for (long i = 0; i < 100; i++) al_free(al_alloc(16384), 16384);
-    double t0 = now_sec();
-    for (long i = 0; i < 20000 / k; i++) {
-        void* p = al_alloc(16384);
-        asm volatile("" : : "r"(p) : "memory");
-        al_free(p, 16384);
-    }
-    report("churn-16KB", t0, now_sec(), 20000 / k);
-    bench_threads(4, 500000 / k);
+    bench_churn("churn-64B", 64, 2000000 / k);
+    bench_churn("churn-1KiB", 1024, 1000000 / k);
+    bench_bulk("bulk-64B", 64, 100000 / k);
+    bench_bulk("bulk-4KiB", 4096, 20000 / k);
+    bench_mixed("mixed-16-256B", 50000 / k);
+    bench_churn("churn-16KiB", 16384, 20000 / k);
+    bench_threads("threads-4x-64B", 4, 500000 / k);
 
     al_teardown_thread();
 #if defined(ALLOC_MIMENTO3) || defined(ALLOC_MIMENTO221)

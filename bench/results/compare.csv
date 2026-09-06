@@ -1,0 +1,39 @@
+# compare.c head-to-head, ns per alloc+free pair, min of 3 runs
+# machine: Cortex-A78AE aarch64, 6 cores, 1.73 GHz, 7.4 GiB, kernel 5.15.148-tegra
+# compiler: Clang 22.1.3 -O3 -march=native -DNDEBUG
+allocator,workload,ns_per_op
+glibc,churn-64B,21.50
+glibc,churn-1KiB,21.90
+glibc,bulk-64B,85.52
+glibc,bulk-4KiB,1976.41
+glibc,mixed-16-256B,89.87
+glibc,churn-16KiB,74.04
+glibc,threads-4x-64B,5.82
+mimalloc-2.1.7,churn-64B,19.80
+mimalloc-2.1.7,churn-1KiB,25.25
+mimalloc-2.1.7,bulk-64B,27.23
+mimalloc-2.1.7,bulk-4KiB,583.17
+mimalloc-2.1.7,mixed-16-256B,27.59
+mimalloc-2.1.7,churn-16KiB,38.95
+mimalloc-2.1.7,threads-4x-64B,5.44
+rpmalloc-1.4.5,churn-64B,9.09
+rpmalloc-1.4.5,churn-1KiB,11.89
+rpmalloc-1.4.5,bulk-64B,38.21
+rpmalloc-1.4.5,bulk-4KiB,1187.85
+rpmalloc-1.4.5,mixed-16-256B,33.14
+rpmalloc-1.4.5,churn-16KiB,18.50
+rpmalloc-1.4.5,threads-4x-64B,2.50
+memento-3.0,churn-64B,21.73
+memento-3.0,churn-1KiB,21.90
+memento-3.0,bulk-64B,67.20
+memento-3.0,bulk-4KiB,738.29
+memento-3.0,mixed-16-256B,139.42
+memento-3.0,churn-16KiB,27.41
+memento-3.0,threads-4x-64B,6.24
+memento-3.0-nostats,churn-64B,15.23
+memento-3.0-nostats,churn-1KiB,15.31
+memento-3.0-nostats,bulk-64B,59.41
+memento-3.0-nostats,bulk-4KiB,725.43
+memento-3.0-nostats,mixed-16-256B,128.25
+memento-3.0-nostats,churn-16KiB,23.14
+memento-3.0-nostats,threads-4x-64B,4.54

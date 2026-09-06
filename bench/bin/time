@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Minimal GNU time stand-in for mimalloc-bench (time -a -o FILE -f FORMAT cmd).
+
+Supports the format specifiers bench.sh actually uses:
+  %E elapsed [hours:]minutes:seconds
+  %e elapsed seconds
+  %M max RSS in kilobytes
+  %U user seconds
+  %S sys seconds
+  %F major page faults
+  %R minor page faults / reclaims
+  %x exit status
+  %% a literal percent
+"""
+from __future__ import print_function
+
+import os
+import resource
+import subprocess
+import sys
+import time as time_mod
+
+
+def parse_args(argv):
+    append = False
+    outfile = None
+    fmt = None
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "-a":
+            append = True
+            i += 1
+        elif a in ("-o", "--output"):
+            outfile = argv[i + 1]
+            i += 2
+        elif a.startswith("-o") and len(a) > 2:
+            outfile = a[2:]
+            i += 1
+        elif a in ("-f", "--format"):
+            fmt = argv[i + 1]
+            i += 2
+        elif a.startswith("-f") and len(a) > 2:
+            fmt = a[2:]
+            i += 1
+        elif a in ("-p", "-v", "-q"):
+            i += 1
+        elif a == "--":
+            i += 1
+            break
+        else:
+            break
+    return append, outfile, fmt, argv[i:]
+
+
+def fmt_elapsed(seconds):
+    if seconds >= 3600.0:
+        h = int(seconds // 3600.0)
+        m = int((seconds % 3600.0) // 60.0)
+        s = seconds % 60.0
+        return "%d:%02d:%05.2f" % (h, m, s)
+    m = int(seconds // 60.0)
+    s = seconds % 60.0
+    return "%d:%05.2f" % (m, s)
+
+
+def expand(fmt, values):
+    out = []
+    i = 0
+    while i < len(fmt):
+        if fmt[i] == "%" and i + 1 < len(fmt):
+            key = fmt[i + 1]
+            out.append(values.get(key, "%" + key))
+            i += 2
+        else:
+            out.append(fmt[i])
+            i += 1
+    return "".join(out)
+
+
+def main():
+    append, outfile, fmt, cmd = parse_args(sys.argv[1:])
+    if not cmd:
+        print("time: missing command", file=sys.stderr)
+        return 1
+    if fmt is None:
+        fmt = "real %e\nuser %U\nsys %S"
+
+    start = time_mod.time()
+    try:
+        proc = subprocess.run(cmd)
+        status = proc.returncode
+    except FileNotFoundError:
+        print("time: cannot run %s" % cmd[0], file=sys.stderr)
+        return 127
+    elapsed = time_mod.time() - start
+    ru = resource.getrusage(resource.RUSAGE_CHILDREN)
+    rss_kb = ru.ru_maxrss
+    if sys.platform == "darwin":
+        rss_kb = int(rss_kb / 1024.0)
+
+    values = {
+        "%": "%",
+        "E": fmt_elapsed(elapsed),
+        "e": "%.2f" % elapsed,
+        "M": str(int(rss_kb)),
+        "U": "%.2f" % ru.ru_utime,
+        "S": "%.2f" % ru.ru_stime,
+        "F": str(int(ru.ru_majflt)),
+        "R": str(int(ru.ru_minflt)),
+        "x": str(int(status)),
+        "C": " ".join(cmd),
+        "P": "0",
+    }
+    line = expand(fmt, values)
+    if not line.endswith("\n"):
+        line += "\n"
+    if outfile:
+        mode = "a" if append else "w"
+        with open(outfile, mode) as f:
+            f.write(line)
+    else:
+        sys.stderr.write(line)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

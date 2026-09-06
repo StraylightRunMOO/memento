@@ -173,9 +173,9 @@ reclaimed), cache occupancy, and the top size classes by live bytes.
 dumps this from a live process; `MEMENTO_DUMP_ATEXIT=1` dumps at exit.
 
 **Stats.** Counters live behind `MEMENTO_STATS` (default on). They cost
-about 2 ns per alloc/free pair on the hot loop (7.3 → 5.3 ns on churn —
-see the benchmark table), so production builds that want the last drop of
-speed can `-DMEMENTO_STATS=0` and lose nothing else.
+a few ns per alloc/free pair on the hot loop (see the benchmark table:
+churn 64 B, 21.7 → 15.2 ns on the capture box), so production builds that
+want the last drop of speed can `-DMEMENTO_STATS=0` and lose nothing else.
 
 **Sanitizers.** ASan and UBSan runs are clean across the test suite, and
 memento poisons freelist blocks properly so use-after-free under ASan
@@ -216,54 +216,59 @@ owner-thread enforcement on the single-threaded container types.
 ## Benchmarks, with the caveats baked in
 
 Head-to-head, one harness (`bench/compare.c`), one machine, min of three
-runs, ns per alloc+free pair (lower is better). A shared CI box, so treat
-the absolutes as ±20% and the *ordering* as the finding:
+runs, ns per alloc+free pair (lower is better). Captured on a 6-core
+Cortex-A78AE at 1.73 GHz (aarch64, Clang 22, `-O3 -march=native`) — treat
+the absolutes as machine-specific and the *ordering* as the finding.
+Full write-up, the raw CSV, and how to pull in
+[mimalloc-bench](https://github.com/daanx/mimalloc-bench): [BENCHMARKS.md](BENCHMARKS.md).
 
-| workload | memento 3.0 | 3.0 `STATS=0` | memento 2.2.1 | mimalloc 2.1.7 | rpmalloc 1.4.5 | glibc |
-|---|---|---|---|---|---|---|
-| churn 64 B | 7.3 | **5.3** | 4.0 | 10.0 | 5.0 | 10.7 |
-| churn 1 KiB | 7.5 | **5.3** | 3.9 | 11.6 | 5.6 | 10.7 |
-| bulk 64 B × 25k | 95 | 96 | 16 | 96 | 95 | 127 |
-| bulk 4 KiB × 5k | 4490 | 4950 | 4815 | 4901 | 4477 | 5433 |
-| mixed 16–256 B | 41 | 42 | 200 | 200 | 24 | 31 |
-| churn 16 KiB | 7.5 | 6.5 | 8.1 | 16.0 | 7.5 | 34.2 |
-| 4-thread churn 64 B | 5.8 | **4.5** | 13.6 | 6.3 | 3.8 | 5.9 |
+![compare.c ns/op](bench/images/compare-ns.png)
+
+| workload | memento 3.0 | 3.0 `STATS=0` | mimalloc 2.1.7 | rpmalloc 1.4.5 | glibc |
+|---|---|---|---|---|---|
+| churn 64 B | 21.7 | 15.2 | 19.8 | **9.1** | 21.5 |
+| churn 1 KiB | 21.9 | 15.3 | 25.3 | **11.9** | 21.9 |
+| bulk 64 B | 67.2 | 59.4 | **27.2** | 38.2 | 85.5 |
+| bulk 4 KiB | 738 | 725 | **583** | 1188 | 1976 |
+| mixed 16–256 B | 139 | 128 | **27.6** | 33.1 | 89.9 |
+| churn 16 KiB | 27.4 | 23.1 | 39.0 | **18.5** | 74.0 |
+| 4-thread churn 64 B | 6.2 | 4.5 | 5.4 | **2.5** | 5.8 |
 
 How to read this without lying to yourself:
 
-- **Against the field:** memento beats mimalloc and glibc on every
-  workload here. rpmalloc still beats us on churn, mixed, and threads —
-  it is a genuinely excellent allocator, and if nanoseconds are all you
-  want, take it. What it won't give you is the rest of this README: heap
+- **Against the field:** rpmalloc still owns the hit path (churn, 16 KiB,
+  threads). `STATS=0` memento beats mimalloc and glibc on those three and
+  sits in the same band as glibc on bulk. **Mixed sizes is the remaining
+  gap** — 4–5× the leading pair on this box. That row is span occupancy /
+  page-claim, not the tcache. If nanoseconds are all you want, take
+  rpmalloc. What it won't give you is the rest of this README: heap
   reports, allocation-site attribution, guard-page arenas, proxy layers,
   and a shim that catches your leaks in a running process.
-- **Against 2.2.1:** the reason v3 exists. Mixed sizes went 200 → 41
-  (that row was the madvise ping-pong — empty spans now keep their pages
+- **Against 2.2.1 (earlier x86 capture):** mixed sizes went 200 → 41 on
+  that machine (the madvise ping-pong — empty spans now keep their pages
   for `MEMENTO_SPAN_PURGE_MS` before the `MADV_DONTNEED`). Four threads
   went 13.6 → 5.8. 16 KiB churn is the page-run cache doing its job.
-- **The churn delta (3.9 → 5.3)** is the span-header `live++` on every
-  alloc — the counter that lets v3 notice a span is empty and hand its
-  pages back at all. 2.2.1 was faster here partly because it *never
-  returned memory to the OS*. You can have that row or you can have RSS
-  that comes back; we chose RSS.
-- **The bulk-64 B delta (95 vs 16)** is two accounting tricks, and we'll
-  name them rather than hide them. First, 2.2.1 prefaults every span at
-  creation (`MADV_WILLNEED` + a first-touch loop), so its page faults
-  happen in the harness warmup, off the clock; v3 faults lazily on
-  purpose (see "first-touch cost" above). Second, 2.2.1's free path never
-  bounded its freelists, so a second bulk lap pops 25k pre-linked blocks
-  while v3 caps the active freelist (64 blocks per class) and recycles
-  the rest at span level. Note that mimalloc and rpmalloc land exactly
-  where we do (96 and 95) — unbounded freelists look great in benchmarks
-  and terrible in `top`.
-- **bulk-4 KiB is a page-fault benchmark wearing an allocator costume.**
-  Everyone is within 20% of 5 µs because the kernel is doing the work.
+- **The churn cost of reclamation** is the occupancy accounting that
+  lets v3 notice a span is empty and hand its pages back at all. 2.2.1
+  was faster here partly because it *never returned memory to the OS*.
+  You can have that row or you can have RSS that comes back; we chose RSS.
+  `-DMEMENTO_STATS=0` is the other lever (21.6 → 14.7 ns here).
+- **bulk-4 KiB is mostly first-touch.** Once spans sit on 2 MiB-aligned
+  VA (so THP can actually collapse), memento lands next to mimalloc
+  (738 vs 583 ns) and ahead of rpmalloc and glibc. Before that fix this
+  row was a 4K-fault costume at ~1.9 µs.
 
-Run it yourself: `cmake -B build bench && cmake --build build` gets you
-`compare_{memento,mimalloc,rpmalloc,glibc}` plus the nanobench-driven
-`benchmark_suite`; `cmake --build build --target run_compare` runs the
-table above. `cc -O2 -Iinclude bench/microbench.c -o microbench
--lpthread` covers the memento-only patterns.
+Run it yourself:
+
+```
+./bench/run_compare.sh                 # 3 runs, min, CSV + PNG
+./bench/run_mimalloc_bench.sh          # optional: daanx/mimalloc-bench subset
+python3 bench/plot.py                  # regenerate graphs from captured CSV
+```
+
+`cc -O2 -Iinclude bench/microbench.c -o microbench -lpthread` covers the
+memento-only patterns. `cmake --build build-bench --target run_compare`
+is the one-shot CMake path.
 
 ## Configuration knobs
 
