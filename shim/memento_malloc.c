@@ -224,6 +224,52 @@ char* strndup(const char* s, size_t n) {
     return p;
 }
 
+int malloc_trim(size_t pad) {
+    (void)pad;
+    memento_shim_ensure();
+    memento_malloc_trim();
+    return 1;
+}
+
+#if defined(__GLIBC__) && __GLIBC_PREREQ(2, 33)
+#include <malloc.h>
+struct mallinfo2 mallinfo2(void) {
+    memento_mallinfo_t m;
+    struct mallinfo2 r;
+    memento_shim_ensure();
+    m = memento_mallinfo();
+    memset(&r, 0, sizeof(r));
+    r.arena = m.arena;
+    r.ordblks = m.ordblks;
+    r.hblks = m.hblks;
+    r.hblkhd = m.hblkhd;
+    r.uordblks = m.uordblks;
+    r.fordblks = m.fordblks;
+    r.keepcost = m.keepcost;
+    return r;
+}
+#else
+struct memento_shim_mallinfo2 {
+    size_t arena, ordblks, smblks, hblks, hblkhd;
+    size_t usmblks, fsmblks, uordblks, fordblks, keepcost;
+};
+struct memento_shim_mallinfo2 mallinfo2(void) {
+    memento_mallinfo_t m;
+    struct memento_shim_mallinfo2 r;
+    memento_shim_ensure();
+    m = memento_mallinfo();
+    memset(&r, 0, sizeof(r));
+    r.arena = m.arena;
+    r.ordblks = m.ordblks;
+    r.hblks = m.hblks;
+    r.hblkhd = m.hblkhd;
+    r.uordblks = m.uordblks;
+    r.fordblks = m.fordblks;
+    r.keepcost = m.keepcost;
+    return r;
+}
+#endif
+
 #if defined(__GNUC__)
 void* __libc_malloc(size_t size) __attribute__((alias("malloc")));
 void  __libc_free(void* ptr) __attribute__((alias("free")));

@@ -188,9 +188,31 @@ extern "C" {
 #endif
 
 /* Per-class LIFO thread cache in front of the active page. slot[0] is a
- * sentinel never popped. Depth is the RSS dial: smaller → less cached. */
+ * sentinel never popped. Depth is the RSS dial: smaller → less cached.
+ * The array is sized to MAX; the live depth is memento_ctl / env. */
+#ifndef MEMENTO_TCACHE_DEPTH_MAX
+    #define MEMENTO_TCACHE_DEPTH_MAX 64
+#endif
 #ifndef MEMENTO_TCACHE_DEPTH
     #define MEMENTO_TCACHE_DEPTH 16
+#endif
+#if MEMENTO_TCACHE_DEPTH > MEMENTO_TCACHE_DEPTH_MAX
+    #undef MEMENTO_TCACHE_DEPTH
+    #define MEMENTO_TCACHE_DEPTH MEMENTO_TCACHE_DEPTH_MAX
+#endif
+
+#ifndef MEMENTO_CPU_HEAPS
+    #define MEMENTO_CPU_HEAPS 1
+#endif
+#ifndef MEMENTO_CPU_MAX
+    #define MEMENTO_CPU_MAX 256
+#endif
+
+#ifndef MEMENTO_VA_RESERVE
+    #define MEMENTO_VA_RESERVE (256ull * 1024ull * 1024ull)
+#endif
+#ifndef MEMENTO_GLOBAL_PAGE_CACHE
+    #define MEMENTO_GLOBAL_PAGE_CACHE 64
 #endif
 
 /* Compile-time ISA for miss-path SIMD. Never cpuid on the hit path. */
@@ -548,6 +570,30 @@ int memento_atfork_register(void);
  * pointers can detect a fork by comparing generations (always 0 where there
  * is no fork). */
 unsigned long memento_fork_generation_current(void);
+
+/* Runtime knobs. op is MEMENTO_CTL_*; arg is in/out depending on op.
+ * Returns 0 on success, -1 on unknown op / bad arg. */
+#define MEMENTO_CTL_GET_TCACHE_DEPTH  1  /* arg: size_t* */
+#define MEMENTO_CTL_SET_TCACHE_DEPTH  2  /* arg: const size_t* */
+#define MEMENTO_CTL_TRIM              3  /* arg: ignored; same as malloc_trim */
+int memento_ctl(int op, void* arg);
+
+/* mallinfo2-shaped snapshot across every registered heap. */
+typedef struct memento_mallinfo_s {
+    size_t arena;     /* bytes mapped from the OS (spans + large) */
+    size_t ordblks;   /* free span/page cache entries */
+    size_t smblks;    /* unused (0) */
+    size_t hblks;     /* huge / page-run mappings cached */
+    size_t hblkhd;    /* bytes in those mappings */
+    size_t usmblks;   /* unused (0) */
+    size_t fsmblks;   /* unused (0) */
+    size_t uordblks;  /* bytes live in user hands */
+    size_t fordblks;  /* bytes sitting in caches */
+    size_t keepcost;  /* bytes malloc_trim can return */
+} memento_mallinfo_t;
+
+memento_mallinfo_t memento_mallinfo(void);
+void memento_malloc_trim(void);
 
 /* ============================================================================
  * Sized API - free() without a size, always available
@@ -1136,7 +1182,7 @@ MEMENTO_FORCE_INLINE int memento_page_idx_of(memento_page_t* pg, void* ptr, size
 
 typedef struct {
     uint32_t top; /* slot[0] sentinel; never popped. Alloc: --top. Free: top++ */
-    void* slot[MEMENTO_TCACHE_DEPTH];
+    void* slot[MEMENTO_TCACHE_DEPTH_MAX];
 } memento_tcache_bin_t;
 #endif
 
@@ -1226,6 +1272,18 @@ struct memento_thread_heap_s {
 
 static MEMENTO_TLS memento_thread_heap_t* memento_tls_heap = NULL;
 static MEMENTO_TLS uint64_t memento_cached_now_ms = 0;
+static uint32_t memento_rt_tcache_depth = MEMENTO_TCACHE_DEPTH;
+#if MEMENTO_CPU_HEAPS
+static memento_thread_heap_t* memento_cpu_heaps[MEMENTO_CPU_MAX];
+static unsigned memento_current_cpu(void);
+#endif
+
+MEMENTO_FORCE_INLINE uint32_t memento_tcache_depth(void) {
+    uint32_t d = memento_rt_tcache_depth;
+    if (d < 2) d = 2;
+    if (d > MEMENTO_TCACHE_DEPTH_MAX) d = MEMENTO_TCACHE_DEPTH_MAX;
+    return d;
+}
 static memento_thread_heap_t* memento_heap_registry = NULL;
 static memento_thread_heap_t* memento_parked_heaps = NULL;
 static int memento_initialized = 0;
@@ -1482,6 +1540,14 @@ static void memento_heap_do_park(memento_thread_heap_t* heap) {
     heap->parked = 1;
     heap->park_next = memento_parked_heaps;
     memento_parked_heaps = heap;
+#if MEMENTO_CPU_HEAPS
+    {
+        unsigned cpu = memento_current_cpu();
+        if (memento_cpu_heaps[cpu] == NULL) {
+            memento_cpu_heaps[cpu] = heap;
+        }
+    }
+#endif
     MEMENTO_REGISTRY_UNLOCK();
 #else
     memento_thread_heap_flush(heap);
@@ -1505,6 +1571,29 @@ memento_thread_heap_t* memento_heap_adopt(void) {
      * recorded node matches where we are running now. */
     int my_node = -2; /* -2: unknown, matches nothing */
     MEMENTO_REGISTRY_LOCK();
+#if MEMENTO_CPU_HEAPS
+    {
+        unsigned cpu = memento_current_cpu();
+        memento_thread_heap_t* ch = memento_cpu_heaps[cpu];
+        if (ch && ch->parked) {
+            memento_thread_heap_t** pp = &memento_parked_heaps;
+            while (*pp) {
+                if (*pp == ch) { *pp = ch->park_next; break; }
+                pp = &(*pp)->park_next;
+            }
+            ch->park_next = NULL;
+            ch->parked = 0;
+            ch->retired = 0;
+            memento_cpu_heaps[cpu] = NULL;
+            MEMENTO_REGISTRY_UNLOCK();
+            ch->thread_id = memento_get_thread_id();
+            ch->numa_node = memento_query_numa_node();
+            memento_thread_heap_flush(ch);
+            memento_heap_install_tls(ch);
+            return ch;
+        }
+    }
+#endif
     if (memento_parked_heaps && memento_parked_heaps->park_next) {
         my_node = memento_query_numa_node();
     }
@@ -1679,6 +1768,18 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
         }
     }
 #endif
+#if MEMENTO_PLATFORM_POSIX && defined(__linux__)
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+    {
+        memento_span_t* s;
+        for (s = heap->span_list; s; s = s->next) {
+            if (s->reclaimed) continue;
+            (void)madvise(s, MEMENTO_SPAN_SIZE, MADV_COLLAPSE);
+        }
+    }
+#endif
     if (MEMENTO_LIKELY(memento_atomic_ptr_load_relaxed(&heap->foreign_head) == NULL)) {
         return;
     }
@@ -1822,16 +1923,255 @@ static void* memento_os_alloc(size_t size) {
     return ptr;
 }
 
+static char*  memento_va_base = NULL;
+static size_t memento_va_off  = 0;
+static size_t memento_va_cap  = 0;
+static int    memento_va_ready = 0;
+
+static int memento_va_owns(const void* ptr, size_t size) {
+    if (memento_va_ready != 1 || !memento_va_base || !ptr) return 0;
+    {
+        const char* p = (const char*)ptr;
+        const char* lo = memento_va_base;
+        const char* hi = memento_va_base + memento_va_cap;
+        return p >= lo && p + size <= hi;
+    }
+}
+
 static void memento_os_free(void* ptr, size_t size) {
     if (MEMENTO_UNLIKELY(!ptr)) return;
     size_t mapped = memento_align_up(size, 4096);
     if (MEMENTO_UNLIKELY(mapped == 0)) mapped = 4096;
+    if (memento_va_owns(ptr, mapped)) {
+#if MEMENTO_PLATFORM_WINDOWS
+        VirtualFree(ptr, mapped, MEM_DECOMMIT);
+#elif MEMENTO_PLATFORM_POSIX
+        (void)mmap(ptr, mapped, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+#endif
+        return;
+    }
     MEMENTO_MUNMAP(ptr, mapped);
 }
+
+/* Process-wide reserved VA: bump 64 KiB / 2 MiB out of one reservation so
+ * we never overmap-and-trim and never race VirtualAlloc on Windows. */
+#if MEMENTO_PLATFORM_POSIX
+static pthread_mutex_t memento_va_lock = PTHREAD_MUTEX_INITIALIZER;
+#define MEMENTO_VA_LOCK()   pthread_mutex_lock(&memento_va_lock)
+#define MEMENTO_VA_UNLOCK() pthread_mutex_unlock(&memento_va_lock)
+#elif MEMENTO_PLATFORM_WINDOWS
+static CRITICAL_SECTION memento_va_lock;
+static int memento_va_lock_ready = 0;
+#define MEMENTO_VA_LOCK()   EnterCriticalSection(&memento_va_lock)
+#define MEMENTO_VA_UNLOCK() LeaveCriticalSection(&memento_va_lock)
+#else
+#define MEMENTO_VA_LOCK()   ((void)0)
+#define MEMENTO_VA_UNLOCK() ((void)0)
+#endif
+
+static void memento_va_init(void) {
+    if (memento_va_ready) return;
+#if MEMENTO_PLATFORM_WINDOWS
+    if (!memento_va_lock_ready) {
+        InitializeCriticalSection(&memento_va_lock);
+        memento_va_lock_ready = 1;
+    }
+#endif
+    memento_va_cap = (size_t)MEMENTO_VA_RESERVE;
+#if MEMENTO_PLATFORM_POSIX
+    #ifndef MAP_NORESERVE
+        #define MAP_NORESERVE 0
+    #endif
+    void* p = mmap(NULL, memento_va_cap, PROT_NONE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) { memento_va_ready = -1; return; }
+    memento_va_base = (char*)p;
+#else
+    void* p = VirtualAlloc(NULL, memento_va_cap, MEM_RESERVE, PAGE_NOACCESS);
+    if (!p) { memento_va_ready = -1; return; }
+    memento_va_base = (char*)p;
+#endif
+    {
+        uintptr_t a = (uintptr_t)memento_va_base;
+        uintptr_t aligned = memento_align_up(a, MEMENTO_SPAN_SIZE);
+        memento_va_off = (size_t)(aligned - a);
+    }
+    memento_va_ready = 1;
+}
+
+static void* memento_va_bump(size_t size, size_t align) {
+    if (memento_va_ready == 0) memento_va_init();
+    if (memento_va_ready != 1 || !size) return NULL;
+    if (align < 4096) align = 4096;
+    MEMENTO_VA_LOCK();
+    {
+        size_t off = memento_align_up(memento_va_off, align);
+        if (off + size > memento_va_cap) {
+            MEMENTO_VA_UNLOCK();
+            return NULL;
+        }
+        char* p = memento_va_base + off;
+        memento_va_off = off + size;
+        MEMENTO_VA_UNLOCK();
+#if MEMENTO_PLATFORM_POSIX
+        void* r = mmap(p, size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        if (r != (void*)p) return NULL;
+#else
+        if (!VirtualAlloc(p, size, MEM_COMMIT, PAGE_READWRITE)) return NULL;
+#endif
+        return p;
+    }
+}
+
+/* Two-level pagemap: dir = addr>>27 (128 MiB), leaf = addr>>16 (64 KiB).
+ * Alloc never consults it. Free / shim use it to reject foreign pointers. */
+#define MEMENTO_PM_BUCKETS    128u
+#define MEMENTO_PM_DIR_SHIFT  27
+#define MEMENTO_PM_LEAF_SHIFT 16
+#define MEMENTO_PM_LEAF_LEN   (1u << (MEMENTO_PM_DIR_SHIFT - MEMENTO_PM_LEAF_SHIFT))
+
+#if MEMENTO_PAGE_SIZE
+typedef struct memento_pm_dir_s {
+    uintptr_t key;
+    memento_page_t* leaf[MEMENTO_PM_LEAF_LEN];
+    struct memento_pm_dir_s* next;
+} memento_pm_dir_t;
+
+static memento_pm_dir_t* memento_pm_bucket[MEMENTO_PM_BUCKETS];
+
+static memento_pm_dir_t* memento_pm_dir(uintptr_t addr, int create) {
+    uintptr_t key = addr >> MEMENTO_PM_DIR_SHIFT;
+    unsigned b = (unsigned)(key % MEMENTO_PM_BUCKETS);
+    memento_pm_dir_t* d = memento_pm_bucket[b];
+    while (d) {
+        if (d->key == key) return d;
+        d = d->next;
+    }
+    if (!create) return NULL;
+    d = (memento_pm_dir_t*)MEMENTO_MALLOC(sizeof(*d));
+    if (!d) return NULL;
+    memset(d, 0, sizeof(*d));
+    d->key = key;
+    d->next = memento_pm_bucket[b];
+    memento_pm_bucket[b] = d;
+    return d;
+}
+
+static void memento_pagemap_set(memento_page_t* pg) {
+#if MEMENTO_PAGE_SIZE
+    if (!pg) return;
+    uintptr_t a = (uintptr_t)pg;
+    memento_pm_dir_t* d = memento_pm_dir(a, 1);
+    if (d) {
+        d->leaf[(a >> MEMENTO_PM_LEAF_SHIFT) & (MEMENTO_PM_LEAF_LEN - 1)] = pg;
+    }
+#else
+    (void)pg;
+#endif
+}
+
+static void memento_pagemap_clear(memento_page_t* pg) {
+#if MEMENTO_PAGE_SIZE
+    if (!pg) return;
+    uintptr_t a = (uintptr_t)pg;
+    memento_pm_dir_t* d = memento_pm_dir(a, 0);
+    if (d) {
+        d->leaf[(a >> MEMENTO_PM_LEAF_SHIFT) & (MEMENTO_PM_LEAF_LEN - 1)] = NULL;
+    }
+#else
+    (void)pg;
+#endif
+}
+
+MEMENTO_FORCE_INLINE memento_page_t* memento_pagemap_lookup(const void* ptr) {
+    uintptr_t a = (uintptr_t)ptr;
+    memento_pm_dir_t* d = memento_pm_dir(a, 0);
+    if (!d) return NULL;
+    return d->leaf[(a >> MEMENTO_PM_LEAF_SHIFT) & (MEMENTO_PM_LEAF_LEN - 1)];
+}
+#endif /* MEMENTO_PAGE_SIZE */
+
+/* Global cache of empty spans (not user objects — mutex is fine). */
+#if MEMENTO_PAGE_SIZE
+static memento_span_t* memento_gspan_head = NULL;
+static uint32_t memento_gspan_count = 0;
+#if MEMENTO_PLATFORM_POSIX
+static pthread_mutex_t memento_gpage_lock = PTHREAD_MUTEX_INITIALIZER;
+#define MEMENTO_GPAGE_LOCK()   pthread_mutex_lock(&memento_gpage_lock)
+#define MEMENTO_GPAGE_UNLOCK() pthread_mutex_unlock(&memento_gpage_lock)
+#elif MEMENTO_PLATFORM_WINDOWS
+static CRITICAL_SECTION memento_gpage_lock;
+static int memento_gpage_lock_ready = 0;
+#define MEMENTO_GPAGE_LOCK()   do { \
+    if (!memento_gpage_lock_ready) { \
+        InitializeCriticalSection(&memento_gpage_lock); \
+        memento_gpage_lock_ready = 1; \
+    } \
+    EnterCriticalSection(&memento_gpage_lock); \
+} while (0)
+#define MEMENTO_GPAGE_UNLOCK() LeaveCriticalSection(&memento_gpage_lock)
+#else
+#define MEMENTO_GPAGE_LOCK()   ((void)0)
+#define MEMENTO_GPAGE_UNLOCK() ((void)0)
+#endif
+
+static memento_span_t* memento_gspan_pop(void) {
+    memento_span_t* s;
+    MEMENTO_GPAGE_LOCK();
+    s = memento_gspan_head;
+    if (s) {
+        memento_gspan_head = s->free_next;
+        s->free_next = NULL;
+        memento_gspan_count--;
+    }
+    MEMENTO_GPAGE_UNLOCK();
+    return s;
+}
+
+static int memento_gspan_push(memento_span_t* s) {
+    if (!s) return 0;
+    MEMENTO_GPAGE_LOCK();
+    if (memento_gspan_count >= MEMENTO_GLOBAL_PAGE_CACHE) {
+        MEMENTO_GPAGE_UNLOCK();
+        return 0;
+    }
+    s->free_next = memento_gspan_head;
+    memento_gspan_head = s;
+    memento_gspan_count++;
+    MEMENTO_GPAGE_UNLOCK();
+    return 1;
+}
+#endif
+
+#if MEMENTO_CPU_HEAPS
+static unsigned memento_current_cpu(void) {
+#if MEMENTO_PLATFORM_WINDOWS
+    return (unsigned)GetCurrentProcessorNumber() % MEMENTO_CPU_MAX;
+#elif defined(__linux__) && defined(SYS_getcpu)
+    {
+        unsigned cpu = 0, node = 0;
+        long rc = syscall(SYS_getcpu, &cpu, &node, (void*)0);
+        if (rc == 0) return cpu % MEMENTO_CPU_MAX;
+    }
+    return 0;
+#else
+    return 0;
+#endif
+}
+#endif
 
 /* Aligned mapping: used for spans, which must sit at an address aligned to
  * their own size so memento_span_of() is a single AND. Overmap and trim. */
 static void* memento_os_alloc_aligned(size_t size, size_t align) {
+    {
+        void* bumped = memento_va_bump(size, align);
+        if (bumped) {
+            memento_os_advise_thp(bumped, size);
+            return bumped;
+        }
+    }
 #if MEMENTO_PLATFORM_POSIX
     if (align < 4096) align = 4096;
     if (size > SIZE_MAX - align) return NULL;
@@ -1920,6 +2260,14 @@ static memento_span_t* memento_span_for_class(memento_thread_heap_t* heap, size_
         heap->span_free_count--;
         span->free_next = NULL;
         span->reclaimed = 0;
+#if MEMENTO_PAGE_SIZE
+    } else if ((span = memento_gspan_pop()) != NULL) {
+        span->owner = heap;
+        span->reclaimed = 0;
+        span->next = heap->span_list;
+        heap->span_list = span;
+        heap->stats.span_count++;
+#endif
     } else {
         span = memento_span_create(heap);
         if (!span) return NULL;
@@ -2000,6 +2348,22 @@ static void memento_span_reclaim(memento_thread_heap_t* heap,
     span->zero_from = span->used; /* below the high-water mark is dirty */
     span->purge_at = now + MEMENTO_SPAN_PURGE_MS;
     span->reclaimed = 1;
+#if MEMENTO_PAGE_SIZE
+    if (heap->span_free_count >= MEMENTO_SPAN_CACHE_MAX && memento_gspan_push(span)) {
+        {
+            memento_span_t** pp = &heap->span_list;
+            while (*pp) {
+                if (*pp == span) { *pp = span->next; break; }
+                pp = &(*pp)->next;
+            }
+        }
+        span->next = NULL;
+        span->owner = NULL;
+        if (heap->stats.span_count) heap->stats.span_count--;
+        memento_span_purge_stale(heap, now);
+        return;
+    }
+#endif
     span->free_next = heap->span_free;
     heap->span_free = span;
     heap->span_free_count++;
@@ -2125,6 +2489,7 @@ static void memento_page_reset(memento_page_t* pg, uint8_t sc) {
     if (rem) {
         pg->bmp[full] = ((uint64_t)1 << rem) - 1u;
     }
+    memento_pagemap_set(pg);
 }
 
 static void memento_page_drain(memento_page_t* pg) {
@@ -2591,7 +2956,7 @@ MEMENTO_FORCE_INLINE void* memento_fast_alloc(memento_thread_heap_t* MEMENTO_RES
                 void* packed[8];
                 uint32_t pk = 0;
                 size_t bs = memento_size_class_to_size(sc);
-                while (pk < 8 && pg->free) {
+                while (pk < 8 && (1u + pk) < memento_tcache_depth() && pg->free) {
                     void* p = pg->free;
                     MEMENTO_ASAN_UNPOISON(p, bs);
                     pg->free = *(void**)p;
@@ -2696,7 +3061,7 @@ MEMENTO_FORCE_INLINE void memento_free_size_class(memento_thread_heap_t* MEMENTO
     memento_debug_on_free(ptr);
 #if MEMENTO_PAGE_SIZE
     memento_tcache_bin_t* bin = &heap->tcache[sc];
-    if (MEMENTO_LIKELY(bin->top < MEMENTO_TCACHE_DEPTH)) {
+    if (MEMENTO_LIKELY(bin->top < memento_tcache_depth())) {
         bin->slot[bin->top++] = ptr;
         MEMENTO_ASAN_POISON(ptr, block_size);
         MEMENTO_STAT_FREE(heap, sc, block_size);
@@ -3010,6 +3375,14 @@ static void memento_sized_free_routed(void* ptr) {
     memento_thread_heap_t* owner;
 
     if (hdr->kind == MEMENTO_KIND_SMALL) {
+#if MEMENTO_PAGE_SIZE
+        if (!memento_pagemap_lookup(raw)) {
+#if MEMENTO_DEBUG
+            memento_debug_fail("memento_free of a pointer not in the pagemap");
+#endif
+            return;
+        }
+#endif
         owner = memento_span_of(raw)->owner;
     } else {
         memento_large_meta_t* meta =
@@ -4003,6 +4376,7 @@ typedef struct memento_proxy_state_s {
     memento_proxy_entry_t* table;        /* open-addressed live-allocation set */
     size_t cap;
     size_t count;
+    size_t tombstones;                   /* (void*)1 slots; compacted on grow */
     size_t live_bytes;
     size_t peak_bytes;
     uint64_t total_allocs;
@@ -4150,6 +4524,32 @@ static void memento_proxy_table_grow(memento_proxy_state_t* st) {
     if (st->table) MEMENTO_FREE(st->table, st->cap * sizeof(memento_proxy_entry_t));
     st->table = nt;
     st->cap = new_cap;
+    st->tombstones = 0;
+}
+
+/* Same-capacity rehash that drops tombstones. 24-hour processes otherwise
+ * fill the table with (void*)1 slots and every lookup walks them. */
+static void memento_proxy_table_compact(memento_proxy_state_t* st) {
+    if (!st->cap || !st->tombstones) return;
+    size_t cap = st->cap;
+    memento_proxy_entry_t* nt = (memento_proxy_entry_t*)MEMENTO_MALLOC(
+        cap * sizeof(memento_proxy_entry_t));
+    if (!nt) return;
+    memset(nt, 0, cap * sizeof(memento_proxy_entry_t));
+    size_t mask = cap - 1;
+    for (size_t i = 0; i < cap; i++) {
+        memento_proxy_entry_t e = st->table[i];
+        if (e.ptr && e.ptr != (void*)1) {
+            size_t j = (size_t)((uintptr_t)e.ptr >> 4) & mask;
+            while (nt[j].ptr) {
+                j = (j + 1) & mask;
+            }
+            nt[j] = e;
+        }
+    }
+    MEMENTO_FREE(st->table, cap * sizeof(memento_proxy_entry_t));
+    st->table = nt;
+    st->tombstones = 0;
 }
 
 static memento_proxy_entry_t* memento_proxy_table_find(memento_proxy_state_t* st,
@@ -4171,6 +4571,9 @@ static void memento_proxy_track(memento_proxy_state_t* st, void* ptr,
         memento_proxy_table_grow(st);
         if ((st->count + 1) * 10 >= st->cap * 7) return; /* grow failed */
     }
+    if (st->tombstones > 16 && st->tombstones * 2 > st->count) {
+        memento_proxy_table_compact(st);
+    }
     size_t mask = st->cap - 1;
     size_t i = (size_t)((uintptr_t)ptr >> 4) & mask;
     uint32_t replaced = 0;
@@ -4188,6 +4591,9 @@ static void memento_proxy_track(memento_proxy_state_t* st, void* ptr,
 #endif
         }
         i = (i + 1) & mask;
+    }
+    if (st->table[i].ptr == (void*)1 && st->tombstones) {
+        st->tombstones--;
     }
     st->table[i].ptr = ptr;
     st->table[i].raw = raw;
@@ -4226,11 +4632,18 @@ static int memento_proxy_untrack(memento_proxy_state_t* st, void* ptr,
     *size_out = e->size;
     if (file_out) *file_out = e->file;
     if (line_out) *line_out = (int)e->line;
-    e->ptr = (void*)1; /* tombstone */
-    st->count--;
-    if (st->live_bytes >= e->size) st->live_bytes -= e->size;
-    else st->live_bytes = 0;
-    st->total_frees++;
+    {
+        size_t nbytes = e->size;
+        e->ptr = (void*)1; /* tombstone */
+        st->tombstones++;
+        st->count--;
+        if (st->live_bytes >= nbytes) st->live_bytes -= nbytes;
+        else st->live_bytes = 0;
+        st->total_frees++;
+    }
+    if (st->tombstones > 16 && st->tombstones * 2 > st->count) {
+        memento_proxy_table_compact(st);
+    }
     return 1;
 }
 
@@ -4652,10 +5065,89 @@ void memento_heap_release_caches(memento_thread_heap_t* heap) {
     }
     while (span) {
         memento_span_t* next = span->next;
-        MEMENTO_MUNMAP(span, MEMENTO_SPAN_SIZE);
+#if MEMENTO_PAGE_SIZE
+        {
+            unsigned pi;
+            for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
+                memento_pagemap_clear(memento_span_page_at(span, pi));
+            }
+        }
+#endif
+        memento_os_free(span, MEMENTO_SPAN_SIZE);
         span = next;
     }
     heap->stats.span_count = 0;
+}
+
+void memento_malloc_trim(void) {
+#if MEMENTO_PAGE_SIZE
+    memento_span_t* s;
+    while ((s = memento_gspan_pop()) != NULL) {
+        {
+            unsigned pi;
+            for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
+                memento_pagemap_clear(memento_span_page_at(s, pi));
+            }
+        }
+        memento_os_free(s, MEMENTO_SPAN_SIZE);
+    }
+#endif
+    MEMENTO_REGISTRY_LOCK();
+    {
+        memento_thread_heap_t* heap = memento_heap_registry;
+        while (heap) {
+            memento_span_purge_stale(heap, ~(uint64_t)0);
+            heap = heap->registry_next;
+        }
+    }
+    MEMENTO_REGISTRY_UNLOCK();
+}
+
+memento_mallinfo_t memento_mallinfo(void) {
+    memento_mallinfo_t info;
+    memset(&info, 0, sizeof(info));
+    MEMENTO_REGISTRY_LOCK();
+    {
+        memento_thread_heap_t* heap = memento_heap_registry;
+        while (heap) {
+            info.uordblks += heap->stats.bytes_live;
+            info.arena += heap->stats.span_count * (size_t)MEMENTO_SPAN_SIZE;
+            info.ordblks += heap->span_free_count;
+            info.hblks += heap->large_count;
+            info.keepcost += heap->span_free_count * (size_t)MEMENTO_SPAN_SIZE;
+            heap = heap->registry_next;
+        }
+    }
+    MEMENTO_REGISTRY_UNLOCK();
+#if MEMENTO_PAGE_SIZE
+    info.ordblks += memento_gspan_count;
+    info.keepcost += memento_gspan_count * (size_t)MEMENTO_SPAN_SIZE;
+#endif
+    info.fordblks = info.keepcost;
+    info.hblkhd = info.hblks * (size_t)MEMENTO_PAGE_RUN_MAX;
+    return info;
+}
+
+int memento_ctl(int op, void* arg) {
+    switch (op) {
+    case MEMENTO_CTL_GET_TCACHE_DEPTH:
+        if (!arg) return -1;
+        *(size_t*)arg = memento_tcache_depth();
+        return 0;
+    case MEMENTO_CTL_SET_TCACHE_DEPTH:
+        if (!arg) return -1;
+        {
+            size_t v = *(size_t*)arg;
+            if (v < 2 || v > MEMENTO_TCACHE_DEPTH_MAX) return -1;
+            memento_rt_tcache_depth = (uint32_t)v;
+            return 0;
+        }
+    case MEMENTO_CTL_TRIM:
+        memento_malloc_trim();
+        return 0;
+    default:
+        return -1;
+    }
 }
 
 /* pthread/FLS TLS destructor: runs on thread exit (not for the main thread).
@@ -4741,6 +5233,16 @@ int memento_atfork_register(void) {
  * memento_thread_heap_get() calls this, so the library self-initializes on
  * first use; calling memento_init() explicitly is still fine (and lets you
  * surface the error). */
+static void memento_apply_env(void) {
+    const char* e = getenv("MEMENTO_TCACHE_DEPTH");
+    if (e && e[0]) {
+        unsigned long v = strtoul(e, NULL, 10);
+        if (v >= 2 && v <= (unsigned long)MEMENTO_TCACHE_DEPTH_MAX) {
+            memento_rt_tcache_depth = (uint32_t)v;
+        }
+    }
+}
+
 #if MEMENTO_PLATFORM_WINDOWS
 static BOOL CALLBACK memento_init_once_cb(PINIT_ONCE once, PVOID param, PVOID* ctx) {
     (void)once; (void)param; (void)ctx;
@@ -4750,6 +5252,8 @@ static BOOL CALLBACK memento_init_once_cb(PINIT_ONCE once, PVOID param, PVOID* c
         return FALSE;
     }
     memento_fls_ready = 1;
+    memento_apply_env();
+    memento_va_init();
     memento_initialized = 1;
     return TRUE;
 }
@@ -4758,6 +5262,8 @@ static void memento_init_once_body(void) {
     if (pthread_key_create(&memento_tls_key, memento_thread_exit_destructor) == 0) {
         memento_tls_key_created = 1;
         memento_atfork_register();
+        memento_apply_env();
+        memento_va_init();
         memento_initialized = 1;
     }
 }

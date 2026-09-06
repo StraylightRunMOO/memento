@@ -1113,6 +1113,29 @@ TEST(exact_pointer_memento_free_is_sized_only) {
     memento_thread_heap_free(heap, p, 64);
 }
 
+TEST(ctl_tcache_and_mallinfo) {
+    size_t d = 0;
+    ASSERT_EQ(memento_ctl(MEMENTO_CTL_GET_TCACHE_DEPTH, &d), 0);
+    ASSERT(d >= 2);
+    ASSERT(d <= MEMENTO_TCACHE_DEPTH_MAX);
+    size_t nd = 8;
+    ASSERT_EQ(memento_ctl(MEMENTO_CTL_SET_TCACHE_DEPTH, &nd), 0);
+    d = 0;
+    ASSERT_EQ(memento_ctl(MEMENTO_CTL_GET_TCACHE_DEPTH, &d), 0);
+    ASSERT_EQ(d, 8);
+    nd = 16;
+    ASSERT_EQ(memento_ctl(MEMENTO_CTL_SET_TCACHE_DEPTH, &nd), 0);
+    ASSERT_EQ(memento_ctl(999, NULL), -1);
+
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    void* p = memento_thread_heap_alloc(heap, 64);
+    ASSERT_NOT_NULL(p);
+    memento_mallinfo_t mi = memento_mallinfo();
+    ASSERT(mi.arena > 0 || mi.uordblks > 0);
+    memento_thread_heap_free(heap, p, 64);
+    memento_malloc_trim();
+}
+
 TEST(heap_report_smoke) {
     memento_thread_heap_t* heap = memento_thread_heap_get();
     /* NULL heap and NULL stream must not crash */
@@ -1225,6 +1248,7 @@ int main(void) {
     RUN_TEST(calloc_zero_always);
     RUN_TEST(span_empty_reclaim);
     RUN_TEST(exact_pointer_memento_free_is_sized_only);
+    RUN_TEST(ctl_tcache_and_mallinfo);
     RUN_TEST(heap_report_smoke);
     
     memento_shutdown();

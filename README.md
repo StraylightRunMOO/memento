@@ -110,7 +110,11 @@ recycled inside the window costs zero page faults. One that stays empty
 past the deadline gets its pages discarded on the next reclamation event.
 There's a backstop (`MEMENTO_SPAN_CACHE_MAX`, 16 spans = 32 MiB per heap)
 so a giant burst can't sit fully mapped forever. If you want deterministic,
-right-now release, `memento_heap_release_caches()` unmaps everything.
+right-now release, `memento_heap_release_caches()` unmaps everything. `memento_malloc_trim()`
+(and the shim's `malloc_trim`) only discards parked empty spans and the
+process-wide span cache — live allocations stay mapped. Runtime tcache
+depth is `memento_ctl(MEMENTO_CTL_SET_TCACHE_DEPTH, &n)` or env
+`MEMENTO_TCACHE_DEPTH`.
 
 **Medium allocations (8 KiB – 256 KiB)** are page runs: whole pages,
 per-page-count free lists, `MADV_FREE` on the cold cache entries so the
@@ -276,6 +280,10 @@ not vibes.
 | `MEMENTO_TCACHE_DEPTH` | 16 | Per-class LIFO tcache slots (RSS vs churn) |
 | `MEMENTO_SIMD_AVX2` / `AVX512` / `NEON` | auto | Miss-path bitmap scan + packed tcache fill; compile-time only |
 | `MEMENTO_SIGNAL` | 1 | Shim: 0 = do not install SIGUSR1 |
+| `MEMENTO_VA_RESERVE` | 256 MiB | Process-wide reserved VA for span bump (no overmap) |
+| `MEMENTO_GLOBAL_PAGE_CACHE` | 64 | Process-wide empty-span cache |
+| `MEMENTO_CPU_HEAPS` | 1 | Park/adopt prefers this CPU's heap |
+| `MEMENTO_TCACHE_DEPTH_MAX` | 64 | Compile-time cap; live depth is `memento_ctl` / env |
 | `MEMENTO_SPAN_PURGE_MS` | 10 | How long an empty span keeps its pages |
 | `MEMENTO_SPAN_CACHE_MAX` | 16 | Backstop: parked spans past this discard eagerly |
 | `MEMENTO_PAGE_RUN_HOT` | 2 | Cached page runs per size kept fully backed |

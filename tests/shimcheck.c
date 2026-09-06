@@ -54,6 +54,14 @@ int main(void) {
     }
 #endif
 
+    malloc_trim(0);
+#if defined(__linux__)
+    {
+        struct mallinfo2 mi = mallinfo2();
+        (void)mi;
+    }
+#endif
+
     free(p);
     free(z);
     free(a);
