@@ -47,21 +47,21 @@ static int failed = 0;
 
 TEST(version_check) {
     /* Check version macros */
-    ASSERT_EQ(MEMENTO_VERSION_MAJOR, 2);
-    ASSERT_EQ(MEMENTO_VERSION_MINOR, 2);
+    ASSERT_EQ(MEMENTO_VERSION_MAJOR, 3);
+    ASSERT_EQ(MEMENTO_VERSION_MINOR, 0);
     ASSERT_EQ(MEMENTO_VERSION_PATCH, 0);
     
     /* Check version string */
     ASSERT_NOT_NULL(memento_version_string());
-    ASSERT_EQ(strcmp(memento_version_string(), "2.2.0"), 0);
+    ASSERT_EQ(strcmp(memento_version_string(), "3.0.0"), 0);
     
     /* Check version number */
-    ASSERT_EQ(memento_version_number(), 0x020200);
+    ASSERT_EQ(memento_version_number(), 0x030000);
     
     /* Check version check function */
     ASSERT(memento_version_check(2, 0, 0));
     ASSERT(memento_version_check(1, 99, 99));
-    ASSERT(!memento_version_check(3, 0, 0));
+    ASSERT(!memento_version_check(4, 0, 0));
 }
 
 TEST(init_shutdown) {
@@ -115,8 +115,8 @@ TEST(align_down) {
 }
 
 TEST(size_classes) {
-    /* 24 size classes with fine grain in 32–512B */
-    ASSERT_EQ(MEMENTO_SIZE_CLASS_COUNT, 24);
+    /* 29 size classes: fine grain in 32–512B, ~1.25x steps in 2K–8K */
+    ASSERT_EQ(MEMENTO_SIZE_CLASS_COUNT, 29);
     ASSERT_EQ(memento_size_class_for(1), 0);       /* 1-32 -> class 0 (32B) */
     ASSERT_EQ(memento_size_class_for(32), 0);
     ASSERT_EQ(memento_size_class_for(33), 1);      /* 33-48 -> class 1 (48B) */
@@ -128,9 +128,11 @@ TEST(size_classes) {
     ASSERT_EQ(memento_size_class_for(256), 10);
     ASSERT_EQ(memento_size_class_for(512), 14);
     ASSERT_EQ(memento_size_class_for(2048), 21);
-    ASSERT_EQ(memento_size_class_for(4096), 22);
-    ASSERT_EQ(memento_size_class_for(8192), 23);
-    ASSERT_EQ(memento_size_class_for(10000), 23);  /* Oversize maps to largest */
+    ASSERT_EQ(memento_size_class_for(2560), 22);
+    ASSERT_EQ(memento_size_class_for(4096), 24);
+    ASSERT_EQ(memento_size_class_for(6144), 26);
+    ASSERT_EQ(memento_size_class_for(8192), 28);
+    ASSERT_EQ(memento_size_class_for(10000), MEMENTO_SIZE_CLASS_NONE);  /* page-run tier, no class */
     
     /* Test round-trip for every class boundary */
     for (size_t sc = 0; sc < MEMENTO_SIZE_CLASS_COUNT; sc++) {
@@ -164,9 +166,16 @@ TEST(heap_null_heap) {
 }
 
 TEST(heap_zero_size) {
+    /* malloc(0) contract (both modes agree): a unique, freeable pointer
+     * from the smallest class — never NULL, never shared. */
     memento_thread_heap_t* heap = memento_thread_heap_get();
-    void* ptr = memento_thread_heap_alloc(heap, 0);
-    ASSERT_NULL(ptr);
+    void* a = memento_thread_heap_alloc(heap, 0);
+    void* b = memento_thread_heap_alloc(heap, 0);
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+    ASSERT_NE(a, b);
+    memento_thread_heap_free(heap, a, 0);
+    memento_thread_heap_free(heap, b, 0);
 }
 
 TEST(heap_null_ptr_free) {
@@ -334,28 +343,29 @@ TEST(pool_basic_alloc_free) {
     memento_pool_destroy(pool);
 }
 
-TEST(pool_exhaustion) {
+TEST(pool_grows) {
     memento_thread_heap_t* heap = memento_thread_heap_get();
     memento_pool_t* pool = memento_pool_create(sizeof(int), 10, heap);
     ASSERT_NOT_NULL(pool);
-    
-    /* Allocate all objects */
-    void* ptrs[10];
-    for (int i = 0; i < 10; i++) {
+
+    /* Pools grow by doubling instead of failing: 10 -> 20 -> 40 -> ... */
+    void* ptrs[100];
+    for (int i = 0; i < 100; i++) {
         ptrs[i] = memento_pool_alloc(pool);
         ASSERT_NOT_NULL(ptrs[i]);
+        *(int*)ptrs[i] = i; /* touch */
     }
-    
-    /* Next allocation should fail (pool exhausted) */
-    void* extra = memento_pool_alloc(pool);
-    ASSERT_NULL(extra);
-    
-    /* Free one and try again */
+    /* Writing distinct ints and reading them back catches aliasing. */
+    for (int i = 0; i < 100; i++) {
+        ASSERT_EQ(*(int*)ptrs[i], i);
+    }
+
+    /* Free one and get one back */
     memento_pool_free(pool, ptrs[0]);
     ptrs[0] = memento_pool_alloc(pool);
     ASSERT_NOT_NULL(ptrs[0]);
-    
-    for (int i = 0; i < 10; i++) {
+
+    for (int i = 0; i < 100; i++) {
         memento_pool_free(pool, ptrs[i]);
     }
     memento_pool_destroy(pool);
@@ -537,6 +547,56 @@ TEST(arena_null_handling) {
     memento_arena_t dummy = {0};
     memento_arena_restore(NULL, NULL);
     memento_arena_restore(&dummy, NULL);
+}
+
+TEST(arena_guarded_basic) {
+    /* Guarded arenas are standalone OS mappings with a PROT_NONE page at
+     * the high-water mark. Exercise create/grow/write/destroy; the fault
+     * behavior itself is tested in test_lifecycle via fork(). */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    memento_arena_t* arena = memento_arena_create_guarded(4096, heap);
+    ASSERT_NOT_NULL(arena);
+
+    /* Fill the first block completely, then overflow into a second. */
+    unsigned char* p = (unsigned char*)memento_arena_alloc(arena, 4096, 16);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0x5A, 4096);
+    void* q = memento_arena_alloc(arena, 2048, 64);
+    ASSERT_NOT_NULL(q);
+    ASSERT(((uintptr_t)q & 63) == 0);
+    memset(q, 0xA5, 2048);
+
+    /* Save/restore within a guarded arena. */
+    memento_arena_save_t save = memento_arena_save(arena);
+    void* r = memento_arena_alloc(arena, 512, 8);
+    ASSERT_NOT_NULL(r);
+    memento_arena_restore(arena, &save);
+
+    memento_arena_destroy(arena);
+}
+
+TEST(arena_reset_multi_block) {
+    /* Grow across several blocks, then reset: excess blocks must go back
+     * and the arena must keep serving. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    memento_arena_t* arena = memento_arena_create(1024, heap);
+    ASSERT_NOT_NULL(arena);
+
+    for (int i = 0; i < 64; i++) {
+        void* p = memento_arena_alloc(arena, 512, 16);
+        ASSERT_NOT_NULL(p);
+        memset(p, i, 512);
+    }
+    size_t grown = memento_arena_capacity(arena);
+    ASSERT(grown > 1024);
+
+    memento_arena_reset(arena);
+    ASSERT_EQ(memento_arena_used(arena), 0);
+    ASSERT(memento_arena_capacity(arena) < grown);
+
+    void* p = memento_arena_alloc(arena, 100, 8);
+    ASSERT_NOT_NULL(p);
+    memento_arena_destroy(arena);
 }
 
 TEST(arena_zero_size) {
@@ -766,6 +826,7 @@ TEST(slab_null_handling) {
  * ============================================================================ */
 
 TEST(stats_basic) {
+#if MEMENTO_STATS
     memento_thread_heap_t* heap = memento_thread_heap_get();
     memento_heap_stats_t stats_before, stats_after;
     
@@ -779,6 +840,17 @@ TEST(stats_basic) {
     
     ASSERT_GE(stats_after.alloc_count, stats_before.alloc_count + 1);
     ASSERT_GE(stats_after.free_count, stats_before.free_count + 1);
+#else
+    /* MEMENTO_STATS=0: counters compiled out, must stay zero */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    void* ptr = memento_thread_heap_alloc(heap, 1024);
+    ASSERT_NOT_NULL(ptr);
+    memento_thread_heap_free(heap, ptr, 1024);
+    memento_heap_stats_t st;
+    memento_thread_heap_stats(heap, &st);
+    ASSERT_EQ(st.alloc_count, 0);
+    ASSERT_EQ(st.free_count, 0);
+#endif
 }
 
 TEST(stats_null_handling) {
@@ -788,6 +860,259 @@ TEST(stats_null_handling) {
     memento_thread_heap_stats(NULL, NULL);
     memento_thread_heap_stats(heap, NULL);
     memento_thread_heap_stats(NULL, NULL);
+}
+
+/* ============================================================================
+ * v3: LUT integrity, aligned alloc, page-run tier, sized basics (exact build)
+ * ============================================================================ */
+
+TEST(lut_exhaustive) {
+    /* Every size 1..8192 must map to the smallest class that fits it.
+     * (v2.2.x shipped a hand-typed LUT whose tail was corrupt: 4096 mapped to
+     * the 768-byte class and the allocator happily overflowed the block.
+     * This test is the receipt that it stays fixed.) */
+    for (size_t s = 1; s <= 8192; s++) {
+        size_t sc = memento_size_class_for(s);
+        ASSERT(sc < MEMENTO_SIZE_CLASS_COUNT);
+        ASSERT(memento_size_class_to_size(sc) >= s);
+        if (sc > 0) {
+            ASSERT(memento_size_class_to_size(sc - 1) < s);
+        }
+    }
+}
+
+TEST(heap_aligned_alloc_exact) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    size_t aligns[] = {16, 32, 64, 128, 256, 4096};
+    for (int i = 0; i < 6; i++) {
+        size_t align = aligns[i];
+        void* ptr = memento_thread_heap_alloc_aligned(heap, 1000, align);
+        ASSERT_NOT_NULL(ptr);
+        ASSERT(((uintptr_t)ptr & (align - 1)) == 0);
+        memset(ptr, 0xAB, 1000);
+        memento_thread_heap_free_aligned(heap, ptr, 1000, align);
+    }
+    /* SIMD contract: 64-byte aligned buffers for AVX-512 */
+    float* vec = (float*)memento_thread_heap_alloc_aligned(heap, 4096, 64);
+    ASSERT_NOT_NULL(vec);
+    ASSERT(((uintptr_t)vec & 63) == 0);
+    memento_thread_heap_free_aligned(heap, vec, 4096, 64);
+    /* bad alignment rejected */
+    ASSERT_NULL(memento_thread_heap_alloc_aligned(heap, 100, 24));
+}
+
+TEST(page_run_tier) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+
+    /* The 100K JSON buffer scenario: same-size alloc/free cycles must reuse
+     * the cached page run instead of donating a fresh VMA each lap. */
+    void* first = memento_thread_heap_alloc(heap, 100 * 1024);
+    ASSERT_NOT_NULL(first);
+    memset(first, 1, 100 * 1024);
+    memento_thread_heap_free(heap, first, 100 * 1024);
+
+    int reused = 0;
+    for (int i = 0; i < 8; i++) {
+        void* p = memento_thread_heap_alloc(heap, 100 * 1024);
+        ASSERT_NOT_NULL(p);
+        if (p == first) reused++;
+        memento_thread_heap_free(heap, p, 100 * 1024);
+    }
+    ASSERT(reused >= 4); /* cache serves most laps */
+
+    /* Page-run blocks are at least 16-aligned and fully writable */
+    void* p = memento_thread_heap_alloc(heap, 200 * 1024);
+    ASSERT_NOT_NULL(p);
+    ASSERT(((uintptr_t)p & 15) == 0);
+    memset(p, 2, 200 * 1024);
+    memento_thread_heap_free(heap, p, 200 * 1024);
+}
+
+TEST(page_run_realloc_hysteresis) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    /* Grow within the same page count: must not move the block. */
+    char* buf = (char*)memento_thread_heap_alloc(heap, 9000);
+    ASSERT_NOT_NULL(buf);
+    memset(buf, 7, 9000);
+    char* grown = (char*)memento_thread_heap_realloc(heap, buf, 9000, 11000);
+    ASSERT(grown == buf); /* 9000 and 11000 round to the same 3 pages */
+    for (int i = 0; i < 9000; i++) {
+        ASSERT(grown[i] == 7);
+    }
+    memento_thread_heap_free(heap, grown, 11000);
+}
+
+TEST(sized_family_in_exact_build) {
+    /* The sized API is always available, even in the default exact build. */
+    void* p = memento_malloc(123);
+    ASSERT_NOT_NULL(p);
+    ASSERT_GE(memento_usable_size(p), 123);
+    memset(p, 3, 123);
+    memento_free(p);
+
+    void* c = memento_calloc(64, 16);
+    ASSERT_NOT_NULL(c);
+    for (int i = 0; i < 1024; i++) {
+        ASSERT(((char*)c)[i] == 0);
+    }
+    memento_free(c);
+
+    void* a = memento_aligned_alloc(256, 5000);
+    ASSERT_NOT_NULL(a);
+    ASSERT(((uintptr_t)a & 255) == 0);
+    ASSERT_GE(memento_usable_size(a), 5000);
+    memento_free(a);
+
+    void* pm = NULL;
+    ASSERT_EQ(memento_posix_memalign(&pm, 64, 777), 0);
+    ASSERT_NOT_NULL(pm);
+    ASSERT(((uintptr_t)pm & 63) == 0);
+    memento_free(pm);
+    ASSERT(memento_posix_memalign(&pm, 24, 100) != 0); /* not a power of 2 */
+
+    ASSERT_GE(memento_good_size(100), 100);
+    ASSERT_EQ(memento_good_size(0), 0);
+
+    memento_free(NULL); /* no-op */
+}
+
+TEST(sized_realloc_growth) {
+    char* buf = (char*)memento_malloc(100);
+    ASSERT_NOT_NULL(buf);
+    memset(buf, 9, 100);
+    for (int round = 0; round < 10; round++) {
+        size_t new_size = 100 << round;
+        buf = (char*)memento_realloc(buf, new_size);
+        ASSERT_NOT_NULL(buf);
+        ASSERT_GE(memento_usable_size(buf), new_size);
+        for (int i = 0; i < 100; i++) {
+            ASSERT(buf[i] == 9);
+        }
+    }
+    memento_free(buf);
+}
+
+TEST(arena_restore_returns_memory) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    memento_arena_t* arena = memento_arena_create(4096, heap);
+    ASSERT_NOT_NULL(arena);
+
+    memento_arena_save_t save = memento_arena_save(arena);
+
+    /* Force several growth blocks */
+    for (int i = 0; i < 8; i++) {
+        void* p = memento_arena_alloc(arena, 64 * 1024, 16);
+        ASSERT_NOT_NULL(p);
+    }
+    size_t capacity_after_growth = memento_arena_capacity(arena);
+    ASSERT(capacity_after_growth >= 64 * 1024);
+
+    /* Restore must return the post-save blocks, not just rewind the bump */
+    memento_arena_restore(arena, &save);
+    ASSERT_EQ(memento_arena_capacity(arena), 4096);
+    ASSERT_EQ(memento_arena_used(arena), 0);
+
+    /* And the arena still works afterwards */
+    void* p = memento_arena_alloc(arena, 1000, 16);
+    ASSERT_NOT_NULL(p);
+    memento_arena_destroy(arena);
+}
+
+TEST(calloc_zero_always) {
+    /* Fresh mappings are kernel-zeroed and calloc skips memset there;
+     * recycled blocks must still come back zeroed. Exercise both lives of
+     * all three tiers. calloc stamps a sized header in every build, so its
+     * pointers go back through the header-routed free, not the exact one. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    const size_t sizes[3] = { 64, 16384, 300000 };
+    for (int t = 0; t < 3; t++) {
+        size_t n = sizes[t];
+        for (int life = 0; life < 2; life++) {
+            unsigned char* p =
+                (unsigned char*)memento_heap_calloc(heap, 1, n);
+            ASSERT_NOT_NULL(p);
+            for (size_t i = 0; i < n; i += 4096 / 8 > n ? 1 : (n / 8 + 1)) {
+                ASSERT_EQ(p[i], 0);
+            }
+            ASSERT_EQ(p[n - 1], 0);
+            memset(p, 0x77, n); /* dirty it for the next life */
+            memento_heap_mfree(heap, p);
+        }
+    }
+}
+
+TEST(span_empty_reclaim) {
+    /* 40k x 64B overflows a single 2 MiB span (which fits ~32k blocks), so
+     * the first span retires as a new partial takes over. Freeing the whole
+     * burst empties the retired span (live == 0) and parks it. Pages are
+     * discarded only after the purge window (MEMENTO_SPAN_PURGE_MS, 10 ms
+     * by default) expires — churn inside the window must not pay a single
+     * page fault. Sleep past the window, then one more alloc+free cycle
+     * triggers a reclaim whose purge walk discards the stale spans. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    memento_heap_stats_t before, after;
+    memento_thread_heap_stats(heap, &before);
+
+    enum { N = 40000 };
+    void** ptrs = (void**)memento_thread_heap_alloc(heap, N * sizeof(void*));
+    ASSERT_NOT_NULL(ptrs);
+    for (int i = 0; i < N; i++) {
+        ptrs[i] = memento_thread_heap_alloc(heap, 64);
+        ASSERT_NOT_NULL(ptrs[i]);
+        memset(ptrs[i], 0x5A, 64);
+    }
+    for (int i = 0; i < N; i++) {
+        memento_thread_heap_free(heap, ptrs[i], 64);
+    }
+    memento_thread_heap_free(heap, ptrs, N * sizeof(void*));
+
+#if defined(_WIN32)
+    Sleep(50);
+#else
+    {
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 50 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+    }
+#endif
+
+    /* Trigger one reclaim so the purge walk sees the expired spans. */
+    void* poke = memento_thread_heap_alloc(heap, 64);
+    ASSERT_NOT_NULL(poke);
+    memento_thread_heap_free(heap, poke, 64);
+
+    memento_thread_heap_stats(heap, &after);
+    ASSERT(after.spans_reclaimed > before.spans_reclaimed);
+
+    /* The heap still works after recycling spans (discarded mappings
+     * re-fault on touch; freelist blocks keep their old contents — this is
+     * malloc, not calloc). */
+    void* p = memento_thread_heap_alloc(heap, 64);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xA5, 64);
+    memento_thread_heap_free(heap, p, 64);
+}
+
+TEST(heap_report_smoke) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    /* NULL heap and NULL stream must not crash */
+    memento_thread_heap_report(NULL, NULL);
+    /* Real report goes to a temp file so we can sanity-check content */
+    FILE* f = tmpfile();
+    ASSERT_NOT_NULL(f);
+    void* p = memento_thread_heap_alloc(heap, 512);
+    memento_thread_heap_report(heap, f);
+    memento_thread_heap_free(heap, p, 512);
+    fflush(f);
+    fseek(f, 0, SEEK_SET);
+    char buf[1024];
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    buf[n] = 0;
+    fclose(f);
+    ASSERT(strstr(buf, "memento heap report") != NULL);
+    ASSERT(strstr(buf, "foreign frees") != NULL);
+    ASSERT(strstr(buf, "bytes live") != NULL);
 }
 
 /* ============================================================================
@@ -832,7 +1157,7 @@ int main(void) {
     /* Pool */
     RUN_TEST(pool_create_destroy);
     RUN_TEST(pool_basic_alloc_free);
-    RUN_TEST(pool_exhaustion);
+    RUN_TEST(pool_grows);
     RUN_TEST(pool_recycle);
     RUN_TEST(pool_various_sizes);
     RUN_TEST(pool_null_handling);
@@ -845,6 +1170,8 @@ int main(void) {
     RUN_TEST(arena_reset);
     RUN_TEST(arena_growth);
     RUN_TEST(arena_null_handling);
+    RUN_TEST(arena_guarded_basic);
+    RUN_TEST(arena_reset_multi_block);
     RUN_TEST(arena_zero_size);
     
     /* Stack */
@@ -867,6 +1194,18 @@ int main(void) {
     /* Statistics */
     RUN_TEST(stats_basic);
     RUN_TEST(stats_null_handling);
+
+    /* v3 additions */
+    RUN_TEST(lut_exhaustive);
+    RUN_TEST(heap_aligned_alloc_exact);
+    RUN_TEST(page_run_tier);
+    RUN_TEST(page_run_realloc_hysteresis);
+    RUN_TEST(sized_family_in_exact_build);
+    RUN_TEST(sized_realloc_growth);
+    RUN_TEST(arena_restore_returns_memory);
+    RUN_TEST(calloc_zero_always);
+    RUN_TEST(span_empty_reclaim);
+    RUN_TEST(heap_report_smoke);
     
     memento_shutdown();
     

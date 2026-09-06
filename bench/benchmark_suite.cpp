@@ -67,29 +67,8 @@ void run_benchmark(const char* name, int iterations, size_t size, AllocFn alloc,
               << " Mops/sec (" << std::setw(6) << std::setprecision(1) << ns_per_op << " ns/op)\n";
 }
 
-// Memento wrappers
+// Memento heap shared by the benchmark lambdas
 memento_thread_heap_t* g_memento_heap = nullptr;
-
-void* memento_alloc(size_t s) {
-    return memento_thread_heap_alloc(g_memento_heap, s);
-}
-
-void memento_free(void* p) {
-    // Use a fixed size for benchmarking simplicity
-    // In real usage, you'd track the size
-    if (p) memento_thread_heap_free(g_memento_heap, p, 256);
-}
-
-void* memento_alloc_size(size_t s) {
-    void* p = memento_thread_heap_alloc(g_memento_heap, s);
-    return p;
-}
-
-void memento_free_size(void* p) {
-    if (!p) return;
-    // For benchmark, assume we know it's the benchmark size
-    // Real code would track this
-}
 
 int main() {
     std::cout << "\n";
@@ -214,16 +193,12 @@ int main() {
     // Summary
     print_header("BENCHMARK SUMMARY");
     std::cout << "\n  Notes:\n";
-    std::cout << "  • Benchmarks run on single thread\n";
-    std::cout << "  • Results may vary based on CPU, memory, and system load\n";
-    std::cout << "  • Memento uses thread-local heaps with zero atomics\n";
-    std::cout << "  • All allocators show competitive performance\n\n";
-    
-    std::cout << "  Memento Design Highlights:\n";
-    std::cout << "  ✓ Lock-free thread-local caching\n";
-    std::cout << "  ✓ No atomics on hot path\n";
-    std::cout << "  ✓ Simple implementation (~1000 lines)\n";
-    std::cout << "  ✓ Single header, easy integration\n\n";
+    std::cout << "  • Benchmarks run on a single thread; numbers vary with CPU and load\n";
+    std::cout << "  • Memento's hot path touches one cache line (freelist head) plus\n";
+    std::cout << "    the span header's live counter; no atomics, no locks\n";
+    std::cout << "  • Empty spans are parked, not discarded: pages return to the kernel\n";
+    std::cout << "    only after MEMENTO_SPAN_PURGE_MS idle (10 ms default), so burst\n";
+    std::cout << "    traffic never pays the madvise ping-pong\n\n";
     
     return 0;
 }

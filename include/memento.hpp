@@ -62,8 +62,8 @@
     #error "Memento C header version macros not found"
 #endif
 
-#if MEMENTO_VERSION < 0x020000
-    #error "Memento C++ wrapper requires C header version 2.0.0 or later"
+#if MEMENTO_VERSION < 0x030000
+    #error "Memento C++ wrapper requires C header version 3.0.0 or later"
 #endif
 
 /* Force-inline for STL allocator hot path */

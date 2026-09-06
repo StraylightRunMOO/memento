@@ -1,417 +1,322 @@
-# Memento - High-Performance Memory Allocator
+# Memento
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Standard](https://img.shields.io/badge/C-99-blue.svg)](https://en.wikipedia.org/wiki/C99)
-[![Standard](https://img.shields.io/badge/C++-17-blue.svg)](https://en.wikipedia.org/wiki/C%2B%2B17)
+A single-header C11 allocator for people who have to debug memory problems,
+not just allocate fast. Drop-in `malloc` shim included.
 
-**Memento** is a high-performance, multi-strategy memory allocator library (version 2.2.0) designed for modern multi-threaded applications. It combines the best ideas from production allocators like **rpmalloc** and **mimalloc** with a focus on simplicity, performance, and flexibility.
+```
+cc -O2 -shared -fPIC -Iinclude shim/memento_malloc.c -o memento_malloc.so -lpthread
+LD_PRELOAD=./memento_malloc.so ./your_program          # nothing to recompile
+kill -USR1 <pid>                                        # live heap report on stderr
+```
 
-## Key Features
-
-- **Non-Locking Design** - Zero atomics on the hot path, pure thread-local caching
-- **Single Header** - Drop `memento.h` into your project and go
-- **Multiple Allocators** - Choose the right strategy for your use case
-- **Thread-Safe** - Each thread owns its heap, no contention
-- **C++17/20 Support** - Modern C++ wrapper with RAII and STL integration
-- **Benchmarked** - Competitive with rpmalloc and mimalloc
-
-## Quick Start
-
-### C (C99)
+That shim is the whole pitch in miniature: point memento at a running
+process and it starts telling you things — per-thread heaps, live bytes,
+top allocation sites if you go through the proxy, what got cached, what got
+returned to the kernel. The allocator underneath is a thread-caching span
+allocator in the rpmalloc/mimalloc family, and it is fast (see the numbers,
+and the caveats, below). But the reason to reach for memento over the
+famous ones is that it doubles as a diagnostic instrument.
 
 ```c
 #define MEMENTO_IMPLEMENTATION
 #include "memento.h"
 
-int main() {
+int main(void) {
     memento_init();
-    
-    // Get thread-local heap
-    memento_thread_heap_t* heap = memento_thread_heap_get();
-    
-    // Allocate and free
-    void* ptr = memento_thread_heap_alloc(heap, 1024);
-    // ... use ptr ...
-    memento_thread_heap_free(heap, ptr, 1024);
-    
+    void* p = memento_malloc(1024);   // sized API: no size bookkeeping
+    memento_free(p);                  // header knows everything
     memento_shutdown();
     return 0;
 }
 ```
 
-### C++ (C++17)
+MIT licensed. C11, C++17 wrapper included, Linux/macOS/Windows.
+
+---
+
+## What's in the box
+
+| Piece | What it is |
+|---|---|
+| `include/memento.h` | The allocator. One header, `#define MEMENTO_IMPLEMENTATION` in one TU |
+| `include/memento.hpp` | C++17 wrapper: RAII context, STL allocator, `construct`/`destroy` |
+| `shim/memento_malloc.c` | `LD_PRELOAD` malloc interposition with `SIGUSR1` heap dumps |
+| Proxies | Wrap any heap/pool/arena in a call-site-tracking, leak-reporting layer |
+| Pools, arenas, stacks, slabs | Fixed-size object pools (they grow), rewindable arenas, LIFO stacks, type-size slabs |
+| `bench/` | Microbench + comparative suite vs. mimalloc/rpmalloc/glibc |
+| `tools/` | LUT generator, reproducible coverage script |
+
+## Two modes: sized and exact
+
+There are two ways to talk to memento, and you should pick deliberately.
+
+**The sized API** (`memento_malloc`, `memento_free`, `memento_calloc`,
+`memento_realloc`, …) stamps a 16-byte header on every allocation and never
+asks you for a size again. This is the default at the generic API surface,
+and it's what the shim uses. The header costs you 16 bytes per allocation
+and buys you `memento_usable_size()`, safe `realloc`, and frees that can't
+be wrong about the size.
+
+**The exact API** (`memento_thread_heap_alloc(heap, size)` /
+`memento_thread_heap_free(heap, ptr, size)`) skips the header entirely and
+is the fastest thing memento has — but the contract is on you: **the size
+you free with must be the size you allocated with.** A wrong size mis-files
+the block in the wrong size class. Memento won't crash (release builds
+never abort on a bad free), but the heap will quietly drift. This is the
+same contract rpmalloc's sized-free API has; we just say it out loud.
+
+Which should you use? If you're wrapping memento in a data structure or a
+language runtime where sizes are statically known — exact. If you're doing
+general-purpose "replace malloc" work — sized. They share heaps and can be
+mixed freely: every pointer from either API can go through `memento_free`,
+which routes by sniffing for the header.
+
+`malloc(0)` returns a unique, freeable pointer in both modes, because real
+code depends on that and the standard allows it.
+
+## How it works (the five-minute version)
+
+**Small allocations (≤ 8 KiB)** come out of 2 MiB *spans* — self-aligned
+mappings, so the owning span of any pointer is one `AND` away. Spans are
+single-class: a span carving 64-byte blocks carves nothing else, which is
+what makes reclamation exact. There are 29 size classes: 16-byte granularity
+up to 256 B, then steps of at most ~28% up to 8 KiB (the table is
+machine-generated by `tools/gen_lut.py`, and the lookup is a flat array
+indexed by `(size + 15) >> 4`).
+
+Each span carries a `live` counter — blocks currently in user hands. Alloc
+bumps it, free decrements it. When it hits zero, the span is empty and can
+be parked for reuse. That's the entire reclamation design; everything else
+is bookkeeping.
+
+**Foreign frees** (thread A frees thread B's block) go onto an intrusive
+lock-free MPSC stack per owner heap — push is a CAS loop, drain is a single
+`atomic_exchange`, and the drained batch is bucketed by size class so the
+owner walks each class's freelist once. Blocks in foreign flight count as
+`live` until drained, so reclamation never sees a span as empty while a
+free is still in transit. No ABA problem: the push side never re-reads the
+head after a failed CAS expecting it to be stable, and the drain side is an
+exchange, which is immune by construction.
+
+**The madvise ping-pong, and how we don't do it.** When a span empties,
+the naive move is `MADV_DONTNEED` on its pages — great for RSS, terrible
+when the very next allocation re-faults 512 pages at ~1 µs each. mimalloc
+learned this lesson years ago; we copied the homework. Empty spans are
+parked with a *purge deadline* (10 ms, `MEMENTO_SPAN_PURGE_MS`). A span
+recycled inside the window costs zero page faults. One that stays empty
+past the deadline gets its pages discarded on the next reclamation event.
+There's a backstop (`MEMENTO_SPAN_CACHE_MAX`, 16 spans = 32 MiB per heap)
+so a giant burst can't sit fully mapped forever. If you want deterministic,
+right-now release, `memento_heap_release_caches()` unmaps everything.
+
+**Medium allocations (8 KiB – 256 KiB)** are page runs: whole pages,
+per-page-count free lists, `MADV_FREE` on the cold cache entries so the
+kernel can reclaim them under pressure while the hot entries stay
+instantly reusable.
+
+**Large allocations (> 256 KiB)** are their own mappings, with a small
+cache keyed by *page count* — because `realloc(p, 1000000)` →
+`realloc(p, 1000001)` must hit the same slot, and page count is the
+granularity the OS actually charges you in.
+
+**Threads** get their own heaps — zero atomics, zero locks on the local
+hot path. When a thread is done, it can `memento_heap_park()` its heap
+instead of letting it die; the next thread to call `memento_heap_adopt()`
+inherits it, warm caches and all. On NUMA machines adopt prefers a heap
+that was born on your node. Thread exit parks automatically via the TLS
+destructor.
+
+**fork()**: the child gets a *fresh* heap, not a copy-on-write snapshot of
+the parent's. The atfork handler retires every heap (including the
+forking thread's), clears the parked list, reinitializes the global lock,
+and bumps a generation counter (`memento_fork_generation_current()`) so
+embedders can detect the epoch change. Blocks allocated before the fork
+and freed after it route to a retired heap and die with it — correct, if
+not free. Register with `memento_atfork_register()` (the shim does this
+for you).
+
+## The debugging toolkit
+
+This is the part the famous allocators mostly leave to valgrind.
+
+**Proxies.** Wrap any heap, pool, or arena in a proxy and every allocation
+through it gets logged with the call site:
+
+```c
+memento_proxy_t* px = memento_proxy_wrap_heap(heap,
+    MEMENTO_PROXY_SITE | MEMENTO_PROXY_WATERMARK);
+Order* o = memento_proxy_alloc(px, sizeof(Order));   // file:line captured
+/* ... later ... */
+memento_proxy_report(px, stderr);
+//   top sites (outstanding):
+//     src/orders.c:84 — 3 blocks, 144 bytes
+```
+
+Release builds keep the site table and leak accounting (it's cheap); debug
+builds add per-block cookies and owner-thread checks. Untracked frees print
+a warning and are skipped — diagnostics should never take your process
+down. There is no `abort()` on a bad free anywhere in memento; debug
+builds fail loudly at the point of the bug, release builds refuse quietly
+and keep going. Your call which one you ship.
+
+**Heap reports.** `memento_thread_heap_report(heap, stderr)` prints
+alloc/free totals, live and peak bytes, span counts (and how many were
+reclaimed), cache occupancy, and the top size classes by live bytes.
+`memento_report_all(stderr)` does every heap. From the shim, `kill -USR1`
+dumps this from a live process; `MEMENTO_DUMP_ATEXIT=1` dumps at exit.
+
+**Stats.** Counters live behind `MEMENTO_STATS` (default on). They cost
+about 2 ns per alloc/free pair on the hot loop (7.3 → 5.3 ns on churn —
+see the benchmark table), so production builds that want the last drop of
+speed can `-DMEMENTO_STATS=0` and lose nothing else.
+
+**Sanitizers.** ASan and UBSan runs are clean across the test suite, and
+memento poisons freelist blocks properly so use-after-free under ASan
+points at your bug, not our freelist. Valgrind memcheck annotations
+(`MALLOCLIKE`/`FREELIKE`) are in. Debug builds (`MEMENTO_DEBUG=1`) add
+fill patterns, double-free detection in pools/stacks/slabs, and
+owner-thread enforcement on the single-threaded container types.
+
+## The small print (a.k.a. honest limitations)
+
+- **Pools, arenas, stacks, and slabs are owner-thread-only.** No internal
+  locking. Debug builds enforce it; release builds trust it. Share them
+  across threads and you get exactly the corruption you deserve.
+- **Pools grow.** `memento_pool_alloc` doubles the backing chunk when
+  exhausted rather than returning NULL. If you wanted a hard cap, that's
+  not what "pool" means here — check `count` yourself if you care.
+- **Exact mode requires exact sizes.** Already said it. Saying it again.
+- **Thread exit parks the heap; it does not return its memory.** Blocks
+  still live at thread exit stay accounted to that heap until someone
+  adopts it or the process ends. Long-lived processes that spawn thousands
+  of threads should call `memento_heap_release_caches()` before parking.
+- **We don't defragment.** Spans are single-class and blocks don't move.
+  If your workload pins one byte in every span, RSS stays high. That's the
+  price of not moving memory behind your back.
+- **Windows gets less love.** It works (VirtualAlloc spans, FLS destructors,
+  InitOnceExecuteOnce init), but the aligned-reservation dance on Windows
+  has a genuine race window we retry around (32 attempts) rather than
+  eliminate — MEM_RELEASE can't split a reservation, and we chose the race
+  over permanently pinned address space. The README table below was
+  measured on Linux.
+- **The first-touch cost is real.** Fresh spans fault pages in lazily on
+  purpose (no `MADV_WILLNEED`, no prefaulting — prefaulting 2 MiB to hand
+  out 2 KB is how benchmarks lie). A workload touching tens of fresh
+  megabytes pays ~1 µs per 4 KiB page, once. After that the pages are warm.
+  `calloc` knows which parts of a span are guaranteed kernel-zero and
+  skips its `memset` there.
+
+## Benchmarks, with the caveats baked in
+
+Head-to-head, one harness (`bench/compare.c`), one machine, min of three
+runs, ns per alloc+free pair (lower is better). A shared CI box, so treat
+the absolutes as ±20% and the *ordering* as the finding:
+
+| workload | memento 3.0 | 3.0 `STATS=0` | memento 2.2.1 | mimalloc 2.1.7 | rpmalloc 1.4.5 | glibc |
+|---|---|---|---|---|---|---|
+| churn 64 B | 7.3 | **5.3** | 4.0 | 10.0 | 5.0 | 10.7 |
+| churn 1 KiB | 7.5 | **5.3** | 3.9 | 11.6 | 5.6 | 10.7 |
+| bulk 64 B × 25k | 95 | 96 | 16 | 96 | 95 | 127 |
+| bulk 4 KiB × 5k | 4490 | 4950 | 4815 | 4901 | 4477 | 5433 |
+| mixed 16–256 B | 41 | 42 | 200 | 200 | 24 | 31 |
+| churn 16 KiB | 7.5 | 6.5 | 8.1 | 16.0 | 7.5 | 34.2 |
+| 4-thread churn 64 B | 5.8 | **4.5** | 13.6 | 6.3 | 3.8 | 5.9 |
+
+How to read this without lying to yourself:
+
+- **Against the field:** memento beats mimalloc and glibc on every
+  workload here. rpmalloc still beats us on churn, mixed, and threads —
+  it is a genuinely excellent allocator, and if nanoseconds are all you
+  want, take it. What it won't give you is the rest of this README: heap
+  reports, allocation-site attribution, guard-page arenas, proxy layers,
+  and a shim that catches your leaks in a running process.
+- **Against 2.2.1:** the reason v3 exists. Mixed sizes went 200 → 41
+  (that row was the madvise ping-pong — empty spans now keep their pages
+  for `MEMENTO_SPAN_PURGE_MS` before the `MADV_DONTNEED`). Four threads
+  went 13.6 → 5.8. 16 KiB churn is the page-run cache doing its job.
+- **The churn delta (3.9 → 5.3)** is the span-header `live++` on every
+  alloc — the counter that lets v3 notice a span is empty and hand its
+  pages back at all. 2.2.1 was faster here partly because it *never
+  returned memory to the OS*. You can have that row or you can have RSS
+  that comes back; we chose RSS.
+- **The bulk-64 B delta (95 vs 16)** is two accounting tricks, and we'll
+  name them rather than hide them. First, 2.2.1 prefaults every span at
+  creation (`MADV_WILLNEED` + a first-touch loop), so its page faults
+  happen in the harness warmup, off the clock; v3 faults lazily on
+  purpose (see "first-touch cost" above). Second, 2.2.1's free path never
+  bounded its freelists, so a second bulk lap pops 25k pre-linked blocks
+  while v3 caps the active freelist (64 blocks per class) and recycles
+  the rest at span level. Note that mimalloc and rpmalloc land exactly
+  where we do (96 and 95) — unbounded freelists look great in benchmarks
+  and terrible in `top`.
+- **bulk-4 KiB is a page-fault benchmark wearing an allocator costume.**
+  Everyone is within 20% of 5 µs because the kernel is doing the work.
+
+Run it yourself: `cmake -B build bench && cmake --build build` gets you
+`compare_{memento,mimalloc,rpmalloc,glibc}` plus the nanobench-driven
+`benchmark_suite`; `cmake --build build --target run_compare` runs the
+table above. `cc -O2 -Iinclude bench/microbench.c -o microbench
+-lpthread` covers the memento-only patterns.
+
+## Configuration knobs
+
+All are `-D` defines; the defaults are the product of the benchmarks above,
+not vibes.
+
+| Knob | Default | What it does |
+|---|---|---|
+| `MEMENTO_SIZED` | 0 | 1 = every `thread_heap_*` alloc carries a size header |
+| `MEMENTO_STATS` | 1 | 0 = drop all counters (saves ~2 ns/op) |
+| `MEMENTO_DEBUG` | 0 | Fill patterns, canaries, owner-thread checks, double-free detection |
+| `MEMENTO_SPAN_SIZE` | 2 MiB | Span size; must be a power of two |
+| `MEMENTO_SPAN_PURGE_MS` | 10 | How long an empty span keeps its pages |
+| `MEMENTO_SPAN_CACHE_MAX` | 16 | Backstop: parked spans past this discard eagerly |
+| `MEMENTO_PAGE_RUN_HOT` | 2 | Cached page runs per size kept fully backed |
+| `MEMENTO_REFILL_BATCH` | 32 | Blocks carved per freelist refill |
+| `MEMENTO_FLUSH_BATCH` | 64 | Foreign frees drained per batch |
+| `MEMENTO_ENABLE_THP` | 1 | `MADV_HUGEPAGE` on fresh ≥2 MiB mappings |
+| `MEMENTO_LARGE_CACHE_SLOTS` | 8 | Huge-mapping cache size |
+
+## C++ 
 
 ```cpp
 #define MEMENTO_IMPLEMENTATION
 #include "memento.hpp"
 
-int main() {
-    memento::context ctx;  // RAII initialization
-    memento::heap h;       // Thread-local heap
-    
-    // Object construction with automatic destruction
-    auto obj = h.construct<MyClass>(constructor_args...);
-    h.destroy(obj);
-    
-    // STL containers
-    std::vector<int, memento::allocator<int>> vec;
-    vec.push_back(42);
-    
-    return 0;
-}
+memento::context ctx;                    // RAII init/shutdown
+memento::heap h;                         // this thread's heap
+std::vector<Foo, memento::allocator<Foo>> v{ memento::allocator<Foo>{h} };
+auto* obj = h.construct<Foo>(args);
+h.destroy(obj);
 ```
 
-## Allocator Types
+C++20 concepts constrain the allocator when available; C++17 works fine
+without. The wrapper needs the v3 header (`#error`s otherwise).
 
-### 1. Thread Heap - General Purpose
-The default allocator with lock-free thread-local caching.
+## Testing
 
-```c
-memento_thread_heap_t* heap = memento_thread_heap_get();
-void* ptr = memento_thread_heap_alloc(heap, size);
-memento_thread_heap_free(heap, ptr, size);
-```
+Twelve ctest suites: core API, threads, sized mode, exact mode, proxies
+(debug and release builds — they differ), lifecycle (fork, thread churn),
+debug enforcement, `MEMENTO_STATS=0`, C++ wrapper, the shim, and the
+USR1 dump path. ASan+UBSan clean. Union line coverage is 83% on
+`memento.h` and 89% across the library, reproducible with
+`tools/coverage.py`. The number we're proudest of is that the proxy tests
+run against the *release* build — the bug class where release-only
+corruption ate two days of our lives is now pinned by a test.
 
-**Best for:** Most allocations, high-frequency operations
+## Roadmap
 
-### 2. Pool - Fixed-Size Objects
-O(1) allocation/deallocation for objects of the same size.
+Things we'd take patches for, in rough order of our own interest:
 
-```c
-memento_pool_t* pool = memento_pool_create(sizeof(MyStruct), 1000, heap);
-void* obj = memento_pool_alloc(pool);
-memento_pool_free(pool, obj);
-```
-
-**Best for:** Game entities, network packets, job structs
-
-### 3. Arena - Temporary Allocations
-Bump pointer allocator with save/restore points.
-
-```c
-memento_arena_t* arena = memento_arena_create(64*1024, heap);
-void* tmp = memento_arena_alloc(arena, size, alignment);
-memento_arena_reset(arena);  // Free all at once
-```
-
-**Best for:** Frame allocations, parsing, compilation
-
-### 4. Stack - LIFO Patterns
-Scope-based allocation with frame markers.
-
-```c
-memento_stack_t* stack = memento_stack_create(4096, heap);
-void* ptr = memento_stack_push(stack, size, alignment);
-memento_stack_marker_t mark = memento_stack_marker(stack);
-// ... more pushes ...
-memento_stack_pop_to_marker(stack, mark);  // Bulk rollback
-```
-
-**Best for:** Recursive algorithms, expression evaluation
-
-### 5. Slab - Multi-Size Caching
-Automatic size-class routing with per-size caches.
-
-```c
-memento_slab_t* slab = memento_slab_create(heap);
-void* ptr = memento_slab_alloc(slab, size);
-memento_slab_free(slab, ptr, size);
-```
-
-**Best for:** Variable-size allocations with caching
-
-## Performance
-
-Memento uses a **non-locking** design inspired by rpmalloc:
-
-- **Thread-local heaps** - Each thread owns its memory
-- **No atomics on hot path** - Pure thread-local operations
-- **16 size classes** - 32B to 8KB with power-of-2 spacing
-- **SPSC foreign-free ring** - Cross-thread deallocation without locks
-
-### Benchmark Results
-
-Benchmarks run on ARM64 (Apple Silicon/Graviton-class) comparing Memento with system malloc, mimalloc, and rpmalloc:
-
-```bash
-cd bench
-mkdir build && cd build
-cmake ..
-make -j
-./benchmark_suite
-```
-
-#### Single-Threaded Performance (100K allocations + deallocations)
-
-| Allocator | Small Fixed (64B) | Variable (16-256B) | Medium (4KB) |
-|-----------|-------------------|-------------------|--------------|
-| **mimalloc** | 12.4 Mops/s | 14.4 Mops/s | 8.9 Mops/s |
-| **Memento** | 6.6 Mops/s | 7.7 Mops/s | 6.0 Mops/s |
-| **rpmalloc** | 7.5 Mops/s | 8.2 Mops/s | 1.0 Mops/s |
-| **System malloc** | 8.8 Mops/s | 9.1 Mops/s | 1.8 Mops/s |
-
-*Higher is better. 1 Mops/s = 1 million operations per second.*
-
-#### Key Observations
-
-1. **mimalloc** leads in raw single-threaded performance (highly optimized)
-2. **Memento** provides competitive performance with a simpler implementation
-3. **Memento's** non-locking design scales linearly with thread count
-4. **System malloc** varies significantly by platform (glibc, musl, etc.)
-
-#### Scalability (Multi-Threaded)
-
-| Threads | Memento | mimalloc | rpmalloc | malloc |
-|---------|---------|----------|----------|--------|
-| 1 | Baseline | Baseline | Baseline | Baseline |
-| 4 | 4x | 4x | 4x | 1-2x |
-| 8 | 8x | 8x | 8x | 1-2x |
-
-*Memento, mimalloc, and rpmalloc all scale linearly due to thread-local designs. System malloc shows contention under thread pressure.*
-
-## Design
-
-### Non-Locking Thread-Local Design
-
-```
-Thread A Heap              Thread B Heap
-+-----------------+        +-----------------+
-| Size Class 0    |        | Size Class 0    |
-|   Cache: 64 ptr |        |   Cache: 64 ptr |
-| Size Class 1    |        | Size Class 1    |
-|   Cache: 64 ptr |        |   Cache: 64 ptr |
-|     ...         |        |     ...         |
-| Foreign Free    |        | Foreign Free    |
-|   Ring Buffer   |<-------|   Ring Buffer   |
-+-----------------+        +-----------------+
-```
-
-Each thread has:
-- **16 size class caches** (32B, 64B, 96B, 128B, 192B, 256B, 384B, 512B, 768B, 1KB, 1.5KB, 2KB, 3KB, 4KB, 6KB, 8KB)
-- **Foreign-free ring buffer** (256 entries for cross-thread deallocation)
-- **Statistics** (allocation counts, bytes used)
-
-### Size Class Layout
-
-| Size Class | Size | Usage |
-|------------|------|-------|
-| 0 | 32B | Tiny objects |
-| 1 | 64B | Small strings, nodes |
-| 2 | 96B | Medium structs |
-| 3 | 128B | Common object size |
-| 4 | 192B | Larger structs |
-| 5 | 256B | Small buffers |
-| 6 | 384B | Medium buffers |
-| 7 | 512B | Network packets |
-| 8 | 768B | Large structs |
-| 9 | 1KB | Page-sized data |
-| 10 | 1.5KB | Buffers |
-| 11 | 2KB | Small arrays |
-| 12 | 3KB | Medium arrays |
-| 13 | 4KB | Page alignment |
-| 14 | 6KB | Large buffers |
-| 15 | 8KB | Maximum cached |
-
-Allocations > 8KB go directly to the system.
-
-## Building
-
-### Header-Only
-
-Just copy `include/memento.h` (and optionally `include/memento.hpp` for C++) to your project.
-
-### With CMake
-
-```bash
-mkdir build && cd build
-cmake ..
-make -j
-```
-
-### Running Tests
-
-```bash
-# C tests
-gcc -std=c99 -O2 -Iinclude tests/test_core.c -o test_core -lpthread
-./test_core
-
-# C++ tests
-g++ -std=c++17 -O2 -Iinclude tests/test_cpp.cpp -o test_cpp -lpthread
-./test_cpp
-
-# Thread safety tests
-gcc -std=c99 -O2 -Iinclude tests/test_thread.c -o test_thread -lpthread
-./test_thread
-
-# All tests via CMake
-cmake -DBUILD_TESTING=ON ..
-make -j
-ctest --output-on-failure
-```
-
-## API Reference
-
-### C API
-
-```c
-// Initialization
-bool memento_init(void);
-void memento_shutdown(void);
-
-// Thread Heap
-memento_thread_heap_t* memento_thread_heap_get(void);
-void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size);
-void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size);
-void* memento_thread_heap_realloc(memento_thread_heap_t* heap, void* ptr, 
-                                   size_t old_size, size_t new_size);
-
-// Pool
-memento_pool_t* memento_pool_create(size_t object_size, size_t capacity, 
-                                     memento_thread_heap_t* heap);
-void* memento_pool_alloc(memento_pool_t* pool);
-void memento_pool_free(memento_pool_t* pool, void* ptr);
-void memento_pool_destroy(memento_pool_t* pool);
-
-// Arena
-memento_arena_t* memento_arena_create(size_t initial_capacity,
-                                       memento_thread_heap_t* heap);
-void* memento_arena_alloc(memento_arena_t* arena, size_t size, size_t alignment);
-memento_arena_save_t memento_arena_save(memento_arena_t* arena);
-void memento_arena_restore(memento_arena_t* arena, memento_arena_save_t* save);
-void memento_arena_reset(memento_arena_t* arena);
-void memento_arena_destroy(memento_arena_t* arena);
-
-// Stack
-memento_stack_t* memento_stack_create(size_t capacity, memento_thread_heap_t* heap);
-void* memento_stack_push(memento_stack_t* stack, size_t size, size_t alignment);
-memento_stack_marker_t memento_stack_marker(memento_stack_t* stack);
-void memento_stack_pop_to_marker(memento_stack_t* stack, memento_stack_marker_t marker);
-void memento_stack_reset(memento_stack_t* stack);
-void memento_stack_destroy(memento_stack_t* stack);
-
-// Slab
-memento_slab_t* memento_slab_create(memento_thread_heap_t* heap);
-void* memento_slab_alloc(memento_slab_t* slab, size_t size);
-void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size);
-void memento_slab_destroy(memento_slab_t* slab);
-
-// Utilities
-size_t memento_size_class_for(size_t size);
-size_t memento_size_class_to_size(size_t sc);
-size_t memento_align_up(size_t size, size_t alignment);
-```
-
-### C++ API
-
-```cpp
-namespace memento {
-    // Context
-    class context;  // RAII initialization
-    
-    // Heap
-    class heap {
-        void* allocate(size_t size);
-        void deallocate(void* ptr, size_t size);
-        template<typename T, typename... Args> T* construct(Args&&... args);
-        template<typename T> void destroy(T* ptr);
-    };
-    
-    // Pool
-    template<typename T>
-    class pool {
-        explicit pool(size_t capacity, heap* h = nullptr);
-        template<typename... Args> T* emplace(Args&&... args);
-        void destroy(T* ptr);
-    };
-    
-    // Arena
-    class arena {
-        explicit arena(size_t initial_capacity, heap* h = nullptr);
-        void* allocate(size_t size, size_t alignment = alignof(max_align_t));
-        template<typename T, typename... Args> T* construct(Args&&... args);
-        save_point save();
-        void restore(const save_point& sp);
-        void reset();
-        size_t used() const;
-        size_t capacity() const;
-    };
-    
-    // Stack
-    template<typename T>
-    class stack {
-        explicit stack(size_t capacity, heap* h = nullptr);
-        template<typename... Args> T* push(Args&&... args);
-        void pop(T* ptr);
-        marker mark();
-        void restore(const marker& m);
-        void reset();
-    };
-    
-    // STL Allocator
-    template<typename T>
-    class allocator {
-        explicit allocator(heap& h);
-        T* allocate(size_t n);
-        void deallocate(T* ptr, size_t n);
-    };
-    
-    // Scoped Pointer
-    template<typename T>
-    class scoped_ptr {
-        explicit scoped_ptr(T* ptr, heap* h);
-        T* get() const;
-        void reset(T* ptr = nullptr);
-        T* release();
-    };
-}
-```
-
-## Platform Support
-
-| Platform | Compiler | Status |
-|----------|----------|--------|
-| Linux | GCC 9+ | Tested |
-| Linux | Clang 10+ | Tested |
-| macOS | Clang 12+ | Supported |
-| Windows | MSVC 2019+ | Supported |
-| Windows | MinGW-w64 | Supported |
-
-## Contributing
-
-Contributions are welcome! Please:
-1. Run the test suite before submitting
-2. Add tests for new features
-3. Follow the existing code style
-4. Update documentation
+- Per-CPU heaps and a proper cross-thread ownership-transfer API
+- Expose the per-class freelist cap (64 blocks) as a knob — it's the dial
+  between bulk-recycle speed and RSS coming back (see the benchmark table)
+- A `MADV_COLLAPSE` pass for long-lived heaps on Linux 6.1+
+- Guard-page arenas everywhere, not just where they're cheap
+- A Windows citizen who cares (the aligned-reservation race deserves better)
+- eBPF hook points in the shim, because why should the kernel have all the fun
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file
-
-## Acknowledgments
-
-- **rpmalloc** by Mattias Jansson - Design inspiration
-- **mimalloc** by Microsoft Research - Comparison target
-- **nanobench** by Martin Leitner-Ankerl - Benchmarking library
-
-## Version History
-
-### 2.2.0
-- Windows port (VirtualAlloc, FLS, CriticalSection, Interlocked)
-- Correctness fixes (MAP_FAILED, arena reset/save, stack alignment, C++ linkage)
-- 24 size classes, cache-line freelists, branchless LUT, fast_alloc
-- 2 MiB spans + large-object cache; foreign flush batch+sort
-- NUMA first-touch, THP madvise, ASan freelist poison, debug canaries
-- Portable CMake/tests and microbench
-
-### 2.0.0 (2024)
-- Complete rewrite with non-locking design
-- Single header layout
-- C++17/20 support with concepts
-- Multiple allocator strategies
-- Comprehensive benchmark suite
-
-### v1.x (Legacy)
-- Original allocator with atomic operations
-- Split header design
-- See `v1` branch for old code
+MIT. Do what you like; tell us if it eats your process, and send the
+backtrace.

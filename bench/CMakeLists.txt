@@ -50,7 +50,7 @@ endif()
 
 # Include directories
 include_directories(
-    ${CMAKE_SOURCE_DIR}/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../include
     ${nanobench_SOURCE_DIR}/src/include
     ${mimalloc_SOURCE_DIR}/include
     ${rpmalloc_SOURCE_DIR}/rpmalloc
@@ -86,3 +86,30 @@ add_custom_target(run_benchmarks
 
 # Install target
 install(TARGETS benchmark_suite DESTINATION bin)
+
+# compare.c: head-to-head harness, one binary per allocator (see file header
+# for methodology and hand-built invocation examples).
+foreach(which memento mimalloc rpmalloc glibc)
+    add_executable(compare_${which} compare.c)
+    set_property(TARGET compare_${which} PROPERTY C_STANDARD 11)
+    target_link_libraries(compare_${which} pthread)
+endforeach()
+target_compile_definitions(compare_memento PRIVATE ALLOC_MIMENTO3)
+target_include_directories(compare_memento PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+target_compile_definitions(compare_mimalloc PRIVATE ALLOC_MIMALLOC)
+target_include_directories(compare_mimalloc PRIVATE ${mimalloc_SOURCE_DIR}/include)
+target_link_libraries(compare_mimalloc mimalloc-static)
+target_compile_definitions(compare_rpmalloc PRIVATE ALLOC_RPMALLOC)
+target_include_directories(compare_rpmalloc PRIVATE ${rpmalloc_SOURCE_DIR}/rpmalloc)
+target_link_libraries(compare_rpmalloc rpmalloc_lib)
+# compare_glibc needs no define: system malloc is the default.
+
+add_custom_target(run_compare
+    COMMAND compare_glibc
+    COMMAND compare_mimalloc
+    COMMAND compare_rpmalloc
+    COMMAND compare_memento
+    DEPENDS compare_glibc compare_mimalloc compare_rpmalloc compare_memento
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running head-to-head allocator comparison..."
+)

@@ -94,10 +94,10 @@ struct Particle {
 
 TEST(version_check) {
     /* Check C API version */
-    ASSERT_EQ(strcmp(memento_version_string(), "2.2.0"), 0);
-    ASSERT_EQ(memento_version_number(), 0x020200);
+    ASSERT_EQ(strcmp(memento_version_string(), "3.0.0"), 0);
+    ASSERT_EQ(memento_version_number(), 0x030000);
     ASSERT(memento_version_check(2, 1, 0));
-    ASSERT(!memento_version_check(3, 0, 0));
+    ASSERT(!memento_version_check(4, 0, 0));
 }
 
 TEST(context_raii) {
@@ -205,26 +205,22 @@ TEST(pool_basic) {
     pool.destroy(p);
 }
 
-TEST(pool_exhaustion) {
+TEST(pool_grows) {
     memento::pool<Particle> pool(10);
-    
+
     std::vector<Particle*> ptrs;
-    for (int i = 0; i < 10; i++) {
+    /* Pools grow by doubling instead of failing: 10 -> 20 -> 40 -> ... */
+    for (int i = 0; i < 100; i++) {
         auto p = pool.emplace();
         ASSERT_NOT_NULL(p);
+        p->x = i; /* touch */
         ptrs.push_back(p);
     }
-    
-    /* Pool exhausted - emplace throws bad_alloc */
-    bool threw = false;
-    try {
-        auto extra = pool.emplace();
-        (void)extra;
-    } catch (const std::bad_alloc&) {
-        threw = true;
+    /* Distinct writes must survive: catches aliasing between blocks. */
+    for (int i = 0; i < 100; i++) {
+        ASSERT_EQ(ptrs[i]->x, i);
     }
-    ASSERT(threw);
-    
+
     for (auto p : ptrs) {
         pool.destroy(p);
     }
@@ -711,7 +707,7 @@ int main() {
         
         std::cout << "\nPool Tests:\n";
         RUN_TEST(pool_basic);
-        RUN_TEST(pool_exhaustion);
+        RUN_TEST(pool_grows);
         RUN_TEST(pool_recycle);
         RUN_TEST(pool_move);
         

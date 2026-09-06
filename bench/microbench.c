@@ -83,6 +83,15 @@ static void bench_mixed(const char* name, memento_thread_heap_t* heap, int iters
     for (int i = 0; i < iters; i++) {
         sz[i] = sizes[i % nsizes];
     }
+    /* Warmup: carve every class and park the emptied spans, so the timed
+     * round measures the steady state (recycling spans) rather than the
+     * one-time cost of first-touch page faults on fresh mappings. */
+    for (int i = 0; i < iters; i++) {
+        ptrs[i] = memento_thread_heap_alloc(heap, sz[i]);
+    }
+    for (int i = iters - 1; i >= 0; i--) {
+        memento_thread_heap_free(heap, ptrs[i], sz[i]);
+    }
     double t0 = now_sec();
     for (int i = 0; i < iters; i++) {
         ptrs[i] = memento_thread_heap_alloc(heap, sz[i]);
