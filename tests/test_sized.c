@@ -129,14 +129,15 @@ TEST(aligned_variants) {
     size_t aligns[] = {16, 32, 64, 128, 256, 512, 4096};
     for (int i = 0; i < 7; i++) {
         size_t align = aligns[i];
-        /* across small / page-run / huge tiers */
+        /* across small / page-run / huge tiers. C11 requires size % align == 0. */
         size_t sizes[] = {8, 1000, 40000, 300 * 1024};
         for (int j = 0; j < 4; j++) {
-            void* p = memento_aligned_alloc(align, sizes[j]);
+            size_t size = (sizes[j] + align - 1) / align * align;
+            void* p = memento_aligned_alloc(align, size);
             ASSERT_NOT_NULL(p);
             ASSERT(((uintptr_t)p & (align - 1)) == 0);
-            ASSERT_GE(memento_usable_size(p), sizes[j]);
-            memset(p, 0x11, sizes[j]);
+            ASSERT_GE(memento_usable_size(p), size);
+            memset(p, 0x11, size);
             memento_free(p);
         }
     }
@@ -145,6 +146,7 @@ TEST(aligned_variants) {
     ASSERT_NOT_NULL(simd);
     ASSERT(((uintptr_t)simd & 63) == 0);
     memento_free(simd);
+    ASSERT_NULL(memento_aligned_alloc(256, 5000)); /* C11 reject */
 }
 
 TEST(usable_size_monotonic) {

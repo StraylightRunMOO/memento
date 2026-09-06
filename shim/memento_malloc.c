@@ -24,7 +24,11 @@
  */
 
 #ifndef _GNU_SOURCE
-#define _GNU_SOURCE /* MAP_ANONYMOUS, sigaction, reallocarray under strict C11 */
+#define _GNU_SOURCE /* MAP_ANONYMOUS, sigaction, reallocarray, strdup under strict C11 */
+#endif
+
+#ifndef MEMENTO_SIGNAL
+#define MEMENTO_SIGNAL 1
 #endif
 
 #include <stddef.h>
@@ -111,11 +115,13 @@ static void memento_shim_on_sigusr1(int sig) {
 
 static void memento_shim_bootstrap(void) {
     memento_init();
+#if MEMENTO_SIGNAL
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = memento_shim_on_sigusr1;
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR1, &sa, NULL);
+#endif
     const char* dump = getenv("MEMENTO_DUMP_ATEXIT");
     if (dump && dump[0] == '1') {
         atexit(memento_shim_dump);
@@ -170,24 +176,59 @@ int posix_memalign(void** out, size_t alignment, size_t size) {
 }
 
 void* memalign(size_t alignment, size_t size) {
+    /* memalign is not C11 aligned_alloc: size need not be a multiple of alignment. */
     memento_shim_ensure();
-    return memento_aligned_alloc(alignment, size);
+    return memento_heap_aligned_alloc(memento_thread_heap_get(), alignment, size);
 }
 
 void* valloc(size_t size) {
     memento_shim_ensure();
-    return memento_aligned_alloc(4096, size);
+    return memento_heap_aligned_alloc(memento_thread_heap_get(), 4096, size);
 }
 
 void* pvalloc(size_t size) {
     memento_shim_ensure();
-    return memento_aligned_alloc(4096, (size + 4095) & ~(size_t)4095);
+    size_t n = (size + 4095) & ~(size_t)4095;
+    return memento_heap_aligned_alloc(memento_thread_heap_get(), 4096, n);
 }
 
 size_t malloc_usable_size(void* ptr) {
+    if (!ptr) return 0;
+    memento_shim_ensure();
     return memento_usable_size(ptr);
 }
 
 void cfree(void* ptr) {
     free(ptr);
 }
+
+char* strdup(const char* s) {
+    if (!s) return NULL;
+    memento_shim_ensure();
+    size_t n = strlen(s) + 1;
+    char* p = (char*)memento_malloc(n);
+    if (p) memcpy(p, s, n);
+    return p;
+}
+
+char* strndup(const char* s, size_t n) {
+    if (!s) return NULL;
+    memento_shim_ensure();
+    size_t len = 0;
+    while (len < n && s[len]) len++;
+    char* p = (char*)memento_malloc(len + 1);
+    if (p) {
+        memcpy(p, s, len);
+        p[len] = 0;
+    }
+    return p;
+}
+
+#if defined(__GNUC__)
+void* __libc_malloc(size_t size) __attribute__((alias("malloc")));
+void  __libc_free(void* ptr) __attribute__((alias("free")));
+void* __libc_calloc(size_t count, size_t size) __attribute__((alias("calloc")));
+void* __libc_realloc(void* ptr, size_t new_size) __attribute__((alias("realloc")));
+void* __libc_memalign(size_t alignment, size_t size) __attribute__((alias("memalign")));
+size_t __libc_malloc_usable_size(void* ptr) __attribute__((alias("malloc_usable_size")));
+#endif

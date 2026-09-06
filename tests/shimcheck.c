@@ -3,10 +3,16 @@
  * LD_PRELOAD=<memento_preload>, so every call below is actually memento.
  * Built and run unmodified: also passes, just boringly (on glibc).
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#if defined(__linux__)
+#include <malloc.h>
+#endif
 
 int main(void) {
     char* p = (char*)malloc(128);
@@ -33,10 +39,27 @@ int main(void) {
     if (!aa) return 8;
     if (((uintptr_t)aa & 127) != 0) return 9;
 
+    if (aligned_alloc(128, 100) != NULL) return 10; /* C11: size % align != 0 */
+
+    char* dup = strdup("memento");
+    if (!dup || strcmp(dup, "memento") != 0) return 11;
+    char* ndup = strndup("memento", 3);
+    if (!ndup || strcmp(ndup, "mem") != 0) return 12;
+
+#if defined(__linux__)
+    {
+        size_t (*usable)(void*) = malloc_usable_size;
+        if (usable(aa) < 4096) return 13;
+        if (usable(NULL) != 0) return 14;
+    }
+#endif
+
     free(p);
     free(z);
     free(a);
     free(aa);
+    free(dup);
+    free(ndup);
     free(NULL);
 
     printf("shimcheck OK\n");

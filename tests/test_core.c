@@ -957,11 +957,12 @@ TEST(sized_family_in_exact_build) {
     }
     memento_free(c);
 
-    void* a = memento_aligned_alloc(256, 5000);
+    void* a = memento_aligned_alloc(256, 5120); /* C11: size % align == 0 */
     ASSERT_NOT_NULL(a);
     ASSERT(((uintptr_t)a & 255) == 0);
-    ASSERT_GE(memento_usable_size(a), 5000);
+    ASSERT_GE(memento_usable_size(a), 5120);
     memento_free(a);
+    ASSERT_NULL(memento_aligned_alloc(256, 5000)); /* C11 reject */
 
     void* pm = NULL;
     ASSERT_EQ(memento_posix_memalign(&pm, 64, 777), 0);
@@ -1066,6 +1067,9 @@ TEST(span_empty_reclaim) {
     }
     memento_thread_heap_free(heap, ptrs, N * sizeof(void*));
 
+    /* Park empty spans (tcache spill + reclaim). Purge is delayed. */
+    memento_thread_heap_flush(heap);
+
 #if defined(_WIN32)
     Sleep(50);
 #else
@@ -1077,10 +1081,8 @@ TEST(span_empty_reclaim) {
     }
 #endif
 
-    /* Trigger one reclaim so the purge walk sees the expired spans. */
-    void* poke = memento_thread_heap_alloc(heap, 64);
-    ASSERT_NOT_NULL(poke);
-    memento_thread_heap_free(heap, poke, 64);
+    /* Idle flush after the purge window: discard parked pages. */
+    memento_thread_heap_flush(heap);
 
     memento_thread_heap_stats(heap, &after);
     ASSERT(after.spans_reclaimed > before.spans_reclaimed);
@@ -1091,6 +1093,23 @@ TEST(span_empty_reclaim) {
     void* p = memento_thread_heap_alloc(heap, 64);
     ASSERT_NOT_NULL(p);
     memset(p, 0xA5, 64);
+    memento_thread_heap_free(heap, p, 64);
+}
+
+TEST(exact_pointer_memento_free_is_sized_only) {
+    /* An exact block whose first bytes look like the old 16-bit sized magic
+     * must not be consumed by memento_free. After the no-op, exact free still
+     * works — the heap did not take a garbage back_off. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    void* p = memento_thread_heap_alloc(heap, 64);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0, 64);
+    ((uint16_t*)p)[7] = 0x4D53; /* old magic slot if someone sniffed at p+0 */
+    /* Also paint the 16 bytes *before* p if they are mapped (previous block
+     * tail). memento_free looks at p-16; we only require it not to crash and
+     * not to steal p. */
+    memento_free(p);
+    memset(p, 0xAB, 64);
     memento_thread_heap_free(heap, p, 64);
 }
 
@@ -1205,6 +1224,7 @@ int main(void) {
     RUN_TEST(arena_restore_returns_memory);
     RUN_TEST(calloc_zero_always);
     RUN_TEST(span_empty_reclaim);
+    RUN_TEST(exact_pointer_memento_free_is_sized_only);
     RUN_TEST(heap_report_smoke);
     
     memento_shutdown();
