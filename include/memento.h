@@ -463,6 +463,10 @@ typedef struct {
     size_t spans_reclaimed;     /* Empty spans returned to the kernel (cumulative) */
     size_t page_run_cached;     /* Page-run blocks sitting in the cache */
     size_t huge_cached;         /* Huge blocks sitting in the exact-size cache */
+    size_t tcache_hits;         /* small-class tcache pops */
+    size_t page_hits;           /* active-page freelist packs */
+    size_t page_claims;         /* switched heap->active[sc] */
+    size_t span_claims;         /* new/recycled 2 MiB span */
 } memento_heap_stats_t;
 
 /* ============================================================================
@@ -498,9 +502,11 @@ memento_thread_heap_t* memento_thread_heap_get(void);
  * pushed onto the heap's lock-free MPSC stack and reclaimed by the owner.
  * EXACT_SIZE mode: the exact allocation size must be passed to free.
  * SIZED mode: size is ignored at free; the header is authoritative. */
+#if MEMENTO_SIZED
 MEMENTO_ATTR_MALLOC MEMENTO_ATTR_ALLOC_SIZE(2) MEMENTO_ATTR_FLATTEN
 void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size);
 void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size);
+#endif
 void* memento_thread_heap_realloc(memento_thread_heap_t* heap, void* ptr,
                                    size_t old_size, size_t new_size);
 
@@ -782,169 +788,112 @@ void memento_slab_destroy(memento_slab_t* slab);
 void* memento_slab_alloc(memento_slab_t* slab, size_t size);
 void memento_slab_free(memento_slab_t* slab, void* ptr, size_t size);
 
-#ifdef __cplusplus
-}
-#endif
 
 /* ============================================================================
- * Implementation Section
- *
- * Include this in exactly ONE source file:
- *   #define MEMENTO_IMPLEMENTATION
- *   #include "memento.h"
+ * Hot path — always included so every TU inlines tcache pop/push.
+ * Miss path (refill, spill, reclaim) is a symbol from the IMPLEMENTATION TU.
  * ============================================================================ */
 
-#ifdef MEMENTO_IMPLEMENTATION
-
-#if MEMENTO_SIMD_AVX512 || MEMENTO_SIMD_AVX2
-    #include <immintrin.h>
-#endif
-#if MEMENTO_SIMD_NEON
-    #include <arm_neon.h>
-#endif
-
-#ifdef __cplusplus
-  #if defined(__clang__)
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wc99-extensions"
-    #pragma clang diagnostic ignored "-Wc++20-designator"
-    #pragma clang diagnostic ignored "-Wmissing-field-initializers"
-  #elif defined(__GNUC__)
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wpedantic"
-    #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
-  #endif
-#endif
-
-#if (MEMENTO_SPAN_SIZE & (MEMENTO_SPAN_SIZE - 1)) != 0
-    #error "MEMENTO_SPAN_SIZE must be a power of two (span-aligned owner lookup)"
-#endif
-#if (MEMENTO_PAGE_RUN_MAX & 4095u) != 0
-    #error "MEMENTO_PAGE_RUN_MAX must be a multiple of 4096"
-#endif
-
-/* ============================================================================
- * Platform Layer
- * ============================================================================ */
-
-#if MEMENTO_PLATFORM_WINDOWS
-    /* Vista+ for FlsAlloc (fiber-local storage with destructor callbacks).
-     * Must be set before windows.h. */
-    /* 0x0601 = Win7+: GetCurrentProcessorNumberEx / GetNumaProcessorNodeEx */
-    #if !defined(_WIN32_WINNT) || (_WIN32_WINNT < 0x0601)
-        #undef _WIN32_WINNT
-        #define _WIN32_WINNT 0x0601
-    #endif
-    #if !defined(WINVER) || (WINVER < 0x0601)
-        #undef WINVER
-        #define WINVER 0x0601
-    #endif
-    #ifndef WIN32_LEAN_AND_MEAN
-        #define WIN32_LEAN_AND_MEAN
-    #endif
-    #include <windows.h>
-    #include <malloc.h> /* _aligned_malloc / _aligned_free */
-
-    #ifndef MEMENTO_MALLOC
-        #define MEMENTO_MALLOC(size) malloc(size)
-    #endif
-    #ifndef MEMENTO_FREE
-        #define MEMENTO_FREE(ptr, size) ((void)(size), free(ptr))
-    #endif
-    #ifndef MEMENTO_ALIGNED_ALLOC
-        #define MEMENTO_ALIGNED_ALLOC(align, size) _aligned_malloc((size), (align))
-    #endif
-    #ifndef MEMENTO_ALIGNED_FREE
-        #define MEMENTO_ALIGNED_FREE(ptr) _aligned_free(ptr)
-    #endif
-    #ifndef MEMENTO_MMAP
-        #define MEMENTO_MMAP(size) \
-            VirtualAlloc(NULL, (SIZE_T)(size), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
-    #endif
-    #ifndef MEMENTO_MUNMAP
-        #define MEMENTO_MUNMAP(ptr, size) \
-            ((void)(size), VirtualFree((ptr), 0, MEM_RELEASE))
-    #endif
-
-    /* MSVC C Interlocked atomics (when not using stdatomic / C++) */
-    #if defined(_MSC_VER) && !defined(__clang__) && !defined(__cplusplus)
-        static __forceinline void* memento_atomic_ptr_load_relaxed(memento_atomic_ptr_t* p) {
-            return *(void* volatile*)p;
-        }
-        static __forceinline void* memento_atomic_ptr_exchange_acq(memento_atomic_ptr_t* p, void* v) {
-            return InterlockedExchangePointer((PVOID*)p, v);
-        }
-        static __forceinline int memento_atomic_ptr_cas_release(
-                memento_atomic_ptr_t* p, void* expected, void* desired) {
-            void* prev = InterlockedCompareExchangePointer((PVOID*)p, desired, expected);
-            return prev == expected;
-        }
-        static __forceinline void memento_atomic_ptr_store_relaxed(
-                memento_atomic_ptr_t* p, void* v) {
-            *(void* volatile*)p = v;
-        }
-    #endif
-
-    /* Registry lock: initialized inside the InitOnce callback (see
-     * memento_init) — the once, not a racy flag, is what serializes it. */
-    static CRITICAL_SECTION memento_registry_lock;
-    static INIT_ONCE memento_init_once = INIT_ONCE_STATIC_INIT;
-
-    #define MEMENTO_REGISTRY_LOCK()   EnterCriticalSection(&memento_registry_lock)
-    #define MEMENTO_REGISTRY_UNLOCK() LeaveCriticalSection(&memento_registry_lock)
-
-    /* FLS for TLS destructor on thread exit */
-    static DWORD memento_fls_index = FLS_OUT_OF_INDEXES;
-    static int memento_fls_ready = 0;
-
-#else /* POSIX */
-    #include <sys/mman.h>
-    #include <unistd.h>
-    #include <pthread.h>
-    #include <errno.h>
-    #include <time.h> /* clock_gettime(CLOCK_MONOTONIC) — the purge clock */
-    #if defined(__linux__)
-        #include <sys/syscall.h>
-    #endif
-
-    #ifndef MAP_ANONYMOUS
-        #ifdef MAP_ANON
-            #define MAP_ANONYMOUS MAP_ANON
-        #else
-            #define MAP_ANONYMOUS 0x20
+#ifndef MEMENTO_ASAN_POISON
+#if MEMENTO_ENABLE_ASAN
+    #if defined(__has_include)
+        #if __has_include(<sanitizer/asan_interface.h>)
+            #include <sanitizer/asan_interface.h>
         #endif
     #endif
+    #ifndef ASAN_POISON_MEMORY_REGION
+        #define ASAN_POISON_MEMORY_REGION(addr, size)   ((void)0)
+        #define ASAN_UNPOISON_MEMORY_REGION(addr, size) ((void)0)
+    #endif
+    #define MEMENTO_ASAN_POISON(p, n)   ASAN_POISON_MEMORY_REGION((p), (n))
+    #define MEMENTO_ASAN_UNPOISON(p, n) ASAN_UNPOISON_MEMORY_REGION((p), (n))
+#else
+    #define MEMENTO_ASAN_POISON(p, n)   do { (void)(p); (void)(n); } while (0)
+    #define MEMENTO_ASAN_UNPOISON(p, n) do { (void)(p); (void)(n); } while (0)
+#endif
+#endif
 
-    #ifndef MEMENTO_MALLOC
-        #define MEMENTO_MALLOC(size) malloc(size)
-    #endif
-    #ifndef MEMENTO_FREE
-        #define MEMENTO_FREE(ptr, size) ((void)(size), free(ptr))
-    #endif
-    #ifndef MEMENTO_ALIGNED_ALLOC
-        /* aligned_alloc requires size multiple of alignment (C11) */
-        #define MEMENTO_ALIGNED_ALLOC(align, size) \
-            aligned_alloc((align), (((size) + (align) - 1) / (align) * (align)))
-    #endif
-    #ifndef MEMENTO_ALIGNED_FREE
-        #define MEMENTO_ALIGNED_FREE(ptr) free(ptr)
-    #endif
-    #ifndef MEMENTO_MMAP
-        #define MEMENTO_MMAP(size) \
-            mmap(NULL, (size), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
-    #endif
-    #ifndef MEMENTO_MUNMAP
-        #define MEMENTO_MUNMAP(ptr, size) munmap((ptr), (size))
-    #endif
+#ifndef MEMENTO_VALGRIND_MALLOCLIKE
+#if MEMENTO_ENABLE_VALGRIND
+    #include <valgrind/memcheck.h>
+    #define MEMENTO_VALGRIND_MALLOCLIKE(p, n) do { \
+        if (RUNNING_ON_VALGRIND) { VALGRIND_MALLOCLIKE_BLOCK((p), (n), 0, 1); } } while (0)
+    #define MEMENTO_VALGRIND_FREELIKE(p) do { \
+        if (RUNNING_ON_VALGRIND) { VALGRIND_FREELIKE_BLOCK((p), 0); } } while (0)
+#else
+    #define MEMENTO_VALGRIND_MALLOCLIKE(p, n) do { (void)(p); (void)(n); } while (0)
+    #define MEMENTO_VALGRIND_FREELIKE(p)      ((void)0)
+#endif
+#endif
 
-    static pthread_mutex_t memento_registry_lock = PTHREAD_MUTEX_INITIALIZER;
-    #define MEMENTO_REGISTRY_LOCK()   pthread_mutex_lock(&memento_registry_lock)
-    #define MEMENTO_REGISTRY_UNLOCK() pthread_mutex_unlock(&memento_registry_lock)
+#if MEMENTO_DEBUG
+    #define MEMENTO_FREE_COOKIE  0xF4EEF4EEA110C8EDull
+    #define MEMENTO_LIVE_COOKIE  0x5AFE5AFE00DD00DDull
+    MEMENTO_FORCE_INLINE uint64_t memento_debug_cookie(const void* ptr) {
+        return MEMENTO_FREE_COOKIE ^ (uint64_t)(uintptr_t)ptr;
+    }
+    MEMENTO_FORCE_INLINE void memento_debug_fail_inline(const char* msg) {
+        fputs("memento: ", stderr);
+        fputs(msg, stderr);
+        fputc('\n', stderr);
+        abort();
+    }
+    MEMENTO_FORCE_INLINE void memento_debug_on_free(const void* ptr) {
+        uint64_t* slot = (uint64_t*)((char*)ptr + sizeof(void*));
+        if (MEMENTO_UNLIKELY(*slot == memento_debug_cookie(ptr))) {
+            memento_debug_fail_inline("double-free detected");
+        }
+        *slot = memento_debug_cookie(ptr);
+    }
+    MEMENTO_FORCE_INLINE void memento_debug_on_alloc(const void* ptr) {
+        uint64_t* slot = (uint64_t*)((char*)ptr + sizeof(void*));
+        if (*slot == memento_debug_cookie(ptr)) {
+            *slot = MEMENTO_LIVE_COOKIE;
+        }
+    }
+    MEMENTO_FORCE_INLINE void memento_debug_mark_free(const void* ptr) {
+        uint64_t* slot = (uint64_t*)((char*)ptr + sizeof(void*));
+        *slot = memento_debug_cookie(ptr);
+    }
+    MEMENTO_FORCE_INLINE void memento_debug_on_foreign_free(const void* ptr) {
+        memento_debug_on_free(ptr);
+    }
+    MEMENTO_FORCE_INLINE void memento_debug_on_foreign_drain(const void* ptr) {
+        uint64_t* slot = (uint64_t*)((char*)ptr + sizeof(void*));
+        if (MEMENTO_UNLIKELY(*slot != memento_debug_cookie(ptr))) {
+            memento_debug_fail_inline("foreign-free stack corrupt (block never stamped)");
+        }
+        *slot = MEMENTO_LIVE_COOKIE;
+    }
+#else
+    #define memento_debug_on_free(ptr)           ((void)0)
+    #define memento_debug_on_alloc(ptr)          ((void)0)
+    #define memento_debug_mark_free(ptr)         ((void)0)
+    #define memento_debug_on_foreign_free(ptr)   ((void)0)
+    #define memento_debug_on_foreign_drain(ptr)  ((void)0)
+#endif
 
-    static pthread_key_t memento_tls_key;
-    static int memento_tls_key_created = 0;
-    static int memento_atfork_registered = 0;
-    static pthread_once_t memento_init_once = PTHREAD_ONCE_INIT;
+#if MEMENTO_STATS
+    #define MEMENTO_STAT_ALLOC(heap, sc, bs) do { \
+        (heap)->stats.alloc_count++; \
+        (heap)->class_live[sc]++; \
+        (heap)->stats.bytes_live += (bs); \
+        (heap)->stats.bytes_allocated += (bs); \
+        if ((heap)->stats.bytes_live > (heap)->stats.bytes_peak) \
+            (heap)->stats.bytes_peak = (heap)->stats.bytes_live; \
+    } while (0)
+    #define MEMENTO_STAT_FREE(heap, sc, bs) do { \
+        (heap)->stats.free_count++; \
+        if ((heap)->class_live[sc]) (heap)->class_live[sc]--; \
+        (heap)->stats.bytes_freed += (bs); \
+        if ((heap)->stats.bytes_live >= (bs)) (heap)->stats.bytes_live -= (bs); \
+        else (heap)->stats.bytes_live = 0; \
+    } while (0)
+#else
+    #ifndef MEMENTO_STAT_ALLOC
+    #define MEMENTO_STAT_ALLOC(heap, sc, bs)       ((void)0)
+    #define MEMENTO_STAT_FREE(heap, sc, bs)        ((void)0)
+    #endif
 #endif
 
 /* ============================================================================
@@ -1117,7 +1066,8 @@ typedef struct memento_span_s {
     int32_t live;        /* blocks currently in user hands — the reclaim trigger */
     int32_t sc;          /* owning size class; -1 while unassigned */
     uint8_t reclaimed;   /* 0 active, 1 free-listed (pages kept), 2 free-listed (MADV_DONTNEED'd) */
-    uint8_t _pad[3];
+    uint8_t collapsed;   /* MADV_COLLAPSE attempted; never retry per span */
+    uint8_t _pad[2];
     uint64_t purge_at;   /* CLOCK_MONOTONIC ms deadline for discarding this span's pages */
     /* Data-region offset from which bytes are guaranteed kernel-zero.
      * Fresh mmap: 0. After MADV_DONTNEED reuse: from the first discarded
@@ -1173,6 +1123,10 @@ MEMENTO_FORCE_INLINE void memento_bmp_set(uint64_t* b, unsigned bit) {
 
 MEMENTO_FORCE_INLINE void memento_bmp_clear(uint64_t* b, unsigned bit) {
     b[bit >> 6] &= ~(1ull << (bit & 63u));
+}
+
+MEMENTO_FORCE_INLINE int memento_bmp_test(const uint64_t* b, unsigned bit) {
+    return (int)((b[bit >> 6] >> (bit & 63u)) & 1u);
 }
 
 MEMENTO_FORCE_INLINE int memento_page_idx_of(memento_page_t* pg, void* ptr, size_t bs) {
@@ -1266,17 +1220,9 @@ struct memento_thread_heap_s {
     uint8_t _pad[1];
 };
 
-/* ============================================================================
- * Thread-local Storage
- * ============================================================================ */
 
-static MEMENTO_TLS memento_thread_heap_t* memento_tls_heap = NULL;
-static MEMENTO_TLS uint64_t memento_cached_now_ms = 0;
-static uint32_t memento_rt_tcache_depth = MEMENTO_TCACHE_DEPTH;
-#if MEMENTO_CPU_HEAPS
-static memento_thread_heap_t* memento_cpu_heaps[MEMENTO_CPU_MAX];
-static unsigned memento_current_cpu(void);
-#endif
+extern MEMENTO_TLS memento_thread_heap_t* memento_tls_heap;
+extern uint32_t memento_rt_tcache_depth;
 
 MEMENTO_FORCE_INLINE uint32_t memento_tcache_depth(void) {
     uint32_t d = memento_rt_tcache_depth;
@@ -1284,6 +1230,279 @@ MEMENTO_FORCE_INLINE uint32_t memento_tcache_depth(void) {
     if (d > MEMENTO_TCACHE_DEPTH_MAX) d = MEMENTO_TCACHE_DEPTH_MAX;
     return d;
 }
+
+void* memento_slow_alloc(memento_thread_heap_t* heap, size_t size, size_t sc, bool* out_fresh);
+void* memento_fast_alloc_miss(memento_thread_heap_t* heap, size_t size, size_t sc, bool* out_fresh);
+void  memento_free_size_class_miss(memento_thread_heap_t* heap, void* ptr, size_t size);
+void  memento_span_reclaim(memento_thread_heap_t* heap, memento_span_t* span, size_t sc);
+void  memento_foreign_push(memento_thread_heap_t* heap, void* ptr, size_t size);
+void  memento_heap_free_local(memento_thread_heap_t* heap, void* ptr, size_t size);
+
+MEMENTO_FORCE_INLINE void* memento_fast_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap,
+                                               size_t size, bool* out_fresh) {
+    if (MEMENTO_UNLIKELY(heap == NULL)) {
+        return NULL;
+    }
+    if (MEMENTO_LIKELY(size <= MEMENTO_MAX_SIZE_CLASS)) {
+        size_t sc = memento_size_class_for(size);
+#if MEMENTO_PAGE_SIZE
+        memento_tcache_bin_t* MEMENTO_RESTRICT bin = &heap->tcache[sc];
+        if (MEMENTO_LIKELY(bin->top > 1)) {
+            void* MEMENTO_RESTRICT ptr = bin->slot[--bin->top];
+            size_t block_size = memento_size_class_to_size(sc);
+            MEMENTO_ASAN_UNPOISON(ptr, block_size);
+            memento_debug_on_alloc(ptr);
+            MEMENTO_STAT_ALLOC(heap, sc, block_size);
+#if MEMENTO_STATS
+            heap->stats.tcache_hits++;
+#endif
+            MEMENTO_VALGRIND_MALLOCLIKE(ptr, size);
+            if (out_fresh) *out_fresh = false;
+            return ptr;
+        }
+#endif
+        return memento_fast_alloc_miss(heap, size, sc, out_fresh);
+    }
+    return memento_slow_alloc(heap, size, 0, out_fresh);
+}
+
+MEMENTO_FORCE_INLINE void* memento_alloc_exact(memento_thread_heap_t* heap, size_t size) {
+    return memento_fast_alloc(heap, size, NULL);
+}
+
+MEMENTO_FORCE_INLINE void memento_free_size_class(memento_thread_heap_t* MEMENTO_RESTRICT heap,
+                                                    void* MEMENTO_RESTRICT ptr, size_t size) {
+    size_t sc = memento_size_class_for(size);
+    size_t block_size = memento_size_class_to_size(sc);
+    MEMENTO_VALGRIND_FREELIKE(ptr);
+    memento_debug_on_free(ptr);
+#if MEMENTO_PAGE_SIZE
+    memento_tcache_bin_t* bin = &heap->tcache[sc];
+    if (MEMENTO_LIKELY(bin->top < memento_tcache_depth())) {
+        bin->slot[bin->top++] = ptr;
+        MEMENTO_ASAN_POISON(ptr, block_size);
+        MEMENTO_STAT_FREE(heap, sc, block_size);
+        return;
+    }
+#endif
+    memento_free_size_class_miss(heap, ptr, size);
+}
+
+MEMENTO_FORCE_INLINE void memento_free_exact(memento_thread_heap_t* heap,
+                                             void* ptr, size_t size) {
+    if (MEMENTO_UNLIKELY(ptr == NULL || heap == NULL)) {
+        return;
+    }
+    if (MEMENTO_UNLIKELY(heap != memento_tls_heap)) {
+#if MEMENTO_PAGE_SIZE
+        if (size <= MEMENTO_MAX_SIZE_CLASS) {
+            memento_page_t* pg = memento_page_of(ptr);
+            memento_foreign_node_t* node = (memento_foreign_node_t*)ptr;
+            memento_debug_on_foreign_free(ptr);
+            node->size = size;
+            void* head = memento_atomic_ptr_load_relaxed(&pg->thread_free);
+            do {
+                node->next = (memento_foreign_node_t*)head;
+            } while (!memento_atomic_ptr_cas_release(&pg->thread_free, head, (void*)node));
+            return;
+        }
+#endif
+        memento_foreign_push(heap, ptr, size);
+        return;
+    }
+    if (MEMENTO_LIKELY(size <= MEMENTO_MAX_SIZE_CLASS)) {
+        memento_free_size_class(heap, ptr, size);
+        return;
+    }
+    memento_heap_free_local(heap, ptr, size);
+}
+
+#if !MEMENTO_SIZED
+MEMENTO_ATTR_MALLOC MEMENTO_ATTR_ALLOC_SIZE(2) MEMENTO_ATTR_FLATTEN
+MEMENTO_FORCE_INLINE void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size) {
+    return memento_fast_alloc(heap, size, NULL);
+}
+MEMENTO_FORCE_INLINE void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size) {
+    memento_free_exact(heap, ptr, size);
+}
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+
+/* ============================================================================
+ * Implementation Section
+ *
+ * Include this in exactly ONE source file:
+ *   #define MEMENTO_IMPLEMENTATION
+ *   #include "memento.h"
+ * ============================================================================ */
+
+#ifdef MEMENTO_IMPLEMENTATION
+
+#if MEMENTO_SIMD_AVX512 || MEMENTO_SIMD_AVX2
+    #include <immintrin.h>
+#endif
+#if MEMENTO_SIMD_NEON
+    #include <arm_neon.h>
+#endif
+
+#ifdef __cplusplus
+  #if defined(__clang__)
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wc99-extensions"
+    #pragma clang diagnostic ignored "-Wc++20-designator"
+    #pragma clang diagnostic ignored "-Wmissing-field-initializers"
+  #elif defined(__GNUC__)
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+    #pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+  #endif
+#endif
+
+#if (MEMENTO_SPAN_SIZE & (MEMENTO_SPAN_SIZE - 1)) != 0
+    #error "MEMENTO_SPAN_SIZE must be a power of two (span-aligned owner lookup)"
+#endif
+#if (MEMENTO_PAGE_RUN_MAX & 4095u) != 0
+    #error "MEMENTO_PAGE_RUN_MAX must be a multiple of 4096"
+#endif
+
+/* ============================================================================
+ * Platform Layer
+ * ============================================================================ */
+
+#if MEMENTO_PLATFORM_WINDOWS
+    /* Vista+ for FlsAlloc (fiber-local storage with destructor callbacks).
+     * Must be set before windows.h. */
+    /* 0x0601 = Win7+: GetCurrentProcessorNumberEx / GetNumaProcessorNodeEx */
+    #if !defined(_WIN32_WINNT) || (_WIN32_WINNT < 0x0601)
+        #undef _WIN32_WINNT
+        #define _WIN32_WINNT 0x0601
+    #endif
+    #if !defined(WINVER) || (WINVER < 0x0601)
+        #undef WINVER
+        #define WINVER 0x0601
+    #endif
+    #ifndef WIN32_LEAN_AND_MEAN
+        #define WIN32_LEAN_AND_MEAN
+    #endif
+    #include <windows.h>
+    #include <malloc.h> /* _aligned_malloc / _aligned_free */
+
+    #ifndef MEMENTO_MALLOC
+        #define MEMENTO_MALLOC(size) malloc(size)
+    #endif
+    #ifndef MEMENTO_FREE
+        #define MEMENTO_FREE(ptr, size) ((void)(size), free(ptr))
+    #endif
+    #ifndef MEMENTO_ALIGNED_ALLOC
+        #define MEMENTO_ALIGNED_ALLOC(align, size) _aligned_malloc((size), (align))
+    #endif
+    #ifndef MEMENTO_ALIGNED_FREE
+        #define MEMENTO_ALIGNED_FREE(ptr) _aligned_free(ptr)
+    #endif
+    #ifndef MEMENTO_MMAP
+        #define MEMENTO_MMAP(size) \
+            VirtualAlloc(NULL, (SIZE_T)(size), MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+    #endif
+    #ifndef MEMENTO_MUNMAP
+        #define MEMENTO_MUNMAP(ptr, size) \
+            ((void)(size), VirtualFree((ptr), 0, MEM_RELEASE))
+    #endif
+
+    /* MSVC C Interlocked atomics (when not using stdatomic / C++) */
+    #if defined(_MSC_VER) && !defined(__clang__) && !defined(__cplusplus)
+        static __forceinline void* memento_atomic_ptr_load_relaxed(memento_atomic_ptr_t* p) {
+            return *(void* volatile*)p;
+        }
+        static __forceinline void* memento_atomic_ptr_exchange_acq(memento_atomic_ptr_t* p, void* v) {
+            return InterlockedExchangePointer((PVOID*)p, v);
+        }
+        static __forceinline int memento_atomic_ptr_cas_release(
+                memento_atomic_ptr_t* p, void* expected, void* desired) {
+            void* prev = InterlockedCompareExchangePointer((PVOID*)p, desired, expected);
+            return prev == expected;
+        }
+        static __forceinline void memento_atomic_ptr_store_relaxed(
+                memento_atomic_ptr_t* p, void* v) {
+            *(void* volatile*)p = v;
+        }
+    #endif
+
+    /* Registry lock: initialized inside the InitOnce callback (see
+     * memento_init) — the once, not a racy flag, is what serializes it. */
+    static CRITICAL_SECTION memento_registry_lock;
+    static INIT_ONCE memento_init_once = INIT_ONCE_STATIC_INIT;
+
+    #define MEMENTO_REGISTRY_LOCK()   EnterCriticalSection(&memento_registry_lock)
+    #define MEMENTO_REGISTRY_UNLOCK() LeaveCriticalSection(&memento_registry_lock)
+
+    /* FLS for TLS destructor on thread exit */
+    static DWORD memento_fls_index = FLS_OUT_OF_INDEXES;
+    static int memento_fls_ready = 0;
+
+#else /* POSIX */
+    #include <sys/mman.h>
+    #include <unistd.h>
+    #include <pthread.h>
+    #include <errno.h>
+    #include <time.h> /* clock_gettime(CLOCK_MONOTONIC) — the purge clock */
+    #if defined(__linux__)
+        #include <sys/syscall.h>
+    #endif
+
+    #ifndef MAP_ANONYMOUS
+        #ifdef MAP_ANON
+            #define MAP_ANONYMOUS MAP_ANON
+        #else
+            #define MAP_ANONYMOUS 0x20
+        #endif
+    #endif
+
+    #ifndef MEMENTO_MALLOC
+        #define MEMENTO_MALLOC(size) malloc(size)
+    #endif
+    #ifndef MEMENTO_FREE
+        #define MEMENTO_FREE(ptr, size) ((void)(size), free(ptr))
+    #endif
+    #ifndef MEMENTO_ALIGNED_ALLOC
+        /* aligned_alloc requires size multiple of alignment (C11) */
+        #define MEMENTO_ALIGNED_ALLOC(align, size) \
+            aligned_alloc((align), (((size) + (align) - 1) / (align) * (align)))
+    #endif
+    #ifndef MEMENTO_ALIGNED_FREE
+        #define MEMENTO_ALIGNED_FREE(ptr) free(ptr)
+    #endif
+    #ifndef MEMENTO_MMAP
+        #define MEMENTO_MMAP(size) \
+            mmap(NULL, (size), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+    #endif
+    #ifndef MEMENTO_MUNMAP
+        #define MEMENTO_MUNMAP(ptr, size) munmap((ptr), (size))
+    #endif
+
+    static pthread_mutex_t memento_registry_lock = PTHREAD_MUTEX_INITIALIZER;
+    #define MEMENTO_REGISTRY_LOCK()   pthread_mutex_lock(&memento_registry_lock)
+    #define MEMENTO_REGISTRY_UNLOCK() pthread_mutex_unlock(&memento_registry_lock)
+
+    static pthread_key_t memento_tls_key;
+    static int memento_tls_key_created = 0;
+    static int memento_atfork_registered = 0;
+    static pthread_once_t memento_init_once = PTHREAD_ONCE_INIT;
+#endif
+
+/* ============================================================================
+ * Thread-local Storage
+ * ============================================================================ */
+
+MEMENTO_TLS memento_thread_heap_t* memento_tls_heap = NULL;
+static MEMENTO_TLS uint64_t memento_cached_now_ms = 0;
+uint32_t memento_rt_tcache_depth = MEMENTO_TCACHE_DEPTH;
+#if MEMENTO_CPU_HEAPS
+static memento_thread_heap_t* memento_cpu_heaps[MEMENTO_CPU_MAX];
+static unsigned memento_current_cpu(void);
+#endif
 static memento_thread_heap_t* memento_heap_registry = NULL;
 static memento_thread_heap_t* memento_parked_heaps = NULL;
 static int memento_initialized = 0;
@@ -1337,65 +1556,7 @@ static void memento_debug_fail(const char* msg) {
 }
 #endif
 
-#if MEMENTO_DEBUG
-    /* Double-free cookie at block offset 8: a 64-bit value derived from the
-     * block's own address, so a user payload colliding with it is a 2^-64
-     * event rather than the 2^-32 one v3.0 shipped. The state machine is
-     * one-way: free stamps the cookie (and screams if it was already there
-     * = double-free); alloc clears a stamped cookie and otherwise leaves the
-     * word alone — it may legitimately hold a sized header or fresh span
-     * garbage, and neither is alloc's business. Blocks freshly carved at
-     * refill are pre-stamped so their first free is indistinguishable from
-     * any other. Foreign pushes stamp through memento_debug_on_foreign_free
-     * and flush un-stamps before handing the block back to the local path. */
-    #define MEMENTO_FREE_COOKIE  0xF4EEF4EEA110C8EDull
-    #define MEMENTO_LIVE_COOKIE  0x5AFE5AFE00DD00DDull
-
-    MEMENTO_FORCE_INLINE uint64_t memento_debug_cookie(const void* ptr) {
-        return MEMENTO_FREE_COOKIE ^ (uint64_t)(uintptr_t)ptr;
-    }
-
-    MEMENTO_FORCE_INLINE void memento_debug_on_free(const void* ptr) {
-        uint64_t* slot = (uint64_t*)((char*)ptr + sizeof(void*));
-        if (MEMENTO_UNLIKELY(*slot == memento_debug_cookie(ptr))) {
-            memento_debug_fail("double-free detected");
-        }
-        *slot = memento_debug_cookie(ptr);
-    }
-
-    MEMENTO_FORCE_INLINE void memento_debug_on_alloc(const void* ptr) {
-        uint64_t* slot = (uint64_t*)((char*)ptr + sizeof(void*));
-        if (*slot == memento_debug_cookie(ptr)) {
-            *slot = MEMENTO_LIVE_COOKIE;
-        }
-    }
-
-    MEMENTO_FORCE_INLINE void memento_debug_mark_free(const void* ptr) {
-        uint64_t* slot = (uint64_t*)((char*)ptr + sizeof(void*));
-        *slot = memento_debug_cookie(ptr);
-    }
-
-    /* Foreign push stamps the cookie too — a block freed twice from two
-     * threads is still a double-free. Flush verifies the stamp before it
-     * trusts node->size. */
-    MEMENTO_FORCE_INLINE void memento_debug_on_foreign_free(const void* ptr) {
-        memento_debug_on_free(ptr);
-    }
-
-    MEMENTO_FORCE_INLINE void memento_debug_on_foreign_drain(const void* ptr) {
-        uint64_t* slot = (uint64_t*)((char*)ptr + sizeof(void*));
-        if (MEMENTO_UNLIKELY(*slot != memento_debug_cookie(ptr))) {
-            memento_debug_fail("foreign-free stack corrupt (block never stamped)");
-        }
-        *slot = MEMENTO_LIVE_COOKIE; /* local free below re-stamps cleanly */
-    }
-#else
-    #define memento_debug_on_free(ptr)           ((void)0)
-    #define memento_debug_on_alloc(ptr)          ((void)0)
-    #define memento_debug_mark_free(ptr)         ((void)0)
-    #define memento_debug_on_foreign_free(ptr)   ((void)0)
-    #define memento_debug_on_foreign_drain(ptr)  ((void)0)
-#endif
+/* debug cookie helpers: public hot path */
 
 /* --------------------------------------------------------------------------
  * NUMA node query (no libnuma dependency)
@@ -1462,7 +1623,7 @@ static uint64_t memento_get_thread_id(void) {
 }
 
 /* Forward decls */
-static void memento_heap_free_local(memento_thread_heap_t* MEMENTO_RESTRICT heap,
+void memento_heap_free_local(memento_thread_heap_t* MEMENTO_RESTRICT heap,
                                     void* MEMENTO_RESTRICT ptr, size_t size);
 static void memento_thread_exit_destructor(void* arg);
 #if MEMENTO_STATS
@@ -1529,6 +1690,8 @@ static void memento_heap_clear_tls(memento_thread_heap_t* heap) {
     }
 }
 
+static void memento_span_purge_stale(memento_thread_heap_t* heap, uint64_t now);
+
 /* Park `heap` (must be the calling thread's heap, TLS already detached or
  * about to be). Late foreign frees stay safe: they park on the MPSC stack and
  * are drained by the adopting thread or by memento_shutdown. */
@@ -1536,6 +1699,7 @@ static void memento_heap_do_park(memento_thread_heap_t* heap) {
     if (!heap) return;
 #if MEMENTO_HEAP_RECYCLING
     memento_thread_heap_flush(heap);
+    memento_span_purge_stale(heap, ~(uint64_t)0);
     MEMENTO_REGISTRY_LOCK();
     heap->parked = 1;
     heap->park_next = memento_parked_heaps;
@@ -1706,14 +1870,14 @@ MEMENTO_FORCE_INLINE bool memento_cache_push(memento_size_class_cache_t* MEMENTO
  * ============================================================================ */
 
 static void memento_span_purge_stale(memento_thread_heap_t* heap, uint64_t now);
-static void memento_span_reclaim(memento_thread_heap_t* heap, memento_span_t* span, size_t sc);
+void memento_span_reclaim(memento_thread_heap_t* heap, memento_span_t* span, size_t sc);
 static uint64_t memento_now_ms(void);
 #if MEMENTO_PAGE_SIZE
 static void memento_page_drain(memento_page_t* pg);
 static memento_page_t* memento_span_page_at(memento_span_t* span, unsigned i);
 #endif
 
-static void memento_foreign_push(memento_thread_heap_t* heap, void* ptr, size_t size) {
+void memento_foreign_push(memento_thread_heap_t* heap, void* ptr, size_t size) {
     memento_foreign_node_t* node = (memento_foreign_node_t*)ptr;
     memento_debug_on_foreign_free(ptr); /* stamps tag; screams on double-free */
     node->size = size;
@@ -1726,6 +1890,10 @@ static void memento_foreign_push(memento_thread_heap_t* heap, void* ptr, size_t 
 /* Drain foreign frees, grouped by size class so the subsequent local frees
  * hit one cache line per class. Grouping is a bucket-prepend per class —
  * O(n) pointer swaps, no comparison sort, no item array shuffling. */
+#if MEMENTO_PLATFORM_POSIX && defined(__linux__)
+static void memento_span_collapse_once(memento_span_t* s);
+#endif
+
 void memento_thread_heap_flush(memento_thread_heap_t* heap) {
     if (MEMENTO_UNLIKELY(heap == NULL)) return;
     memento_cached_now_ms = memento_now_ms();
@@ -1769,21 +1937,15 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
     }
 #endif
 #if MEMENTO_PLATFORM_POSIX && defined(__linux__)
-#ifndef MADV_COLLAPSE
-#define MADV_COLLAPSE 25
-#endif
     {
+        /* THP collapse is a hint for long-lived heaps (Linux 6.1+). Doing it
+         * on every flush is a syscall per span per idle tick — and on 5.15
+         * the number is EINVAL every time. One attempt per span, and the
+         * first EINVAL/ENOSYS retires the feature for the process. */
         memento_span_t* s;
         for (s = heap->span_list; s; s = s->next) {
             if (s->reclaimed) continue;
-            /* syscall: madvise(2) is a BSD/GNU extension and is not declared
-             * under strict -std=c11 + _POSIX_C_SOURCE. The number 25 is the
-             * frozen Linux UAPI value (6.1+); older kernels return EINVAL. */
-#if defined(SYS_madvise)
-            (void)syscall(SYS_madvise, s, (size_t)MEMENTO_SPAN_SIZE, MADV_COLLAPSE);
-#elif defined(MADV_COLLAPSE)
-            (void)madvise(s, MEMENTO_SPAN_SIZE, MADV_COLLAPSE);
-#endif
+            memento_span_collapse_once(s);
         }
     }
 #endif
@@ -1848,7 +2010,36 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
  * and the MADV_DONTNEED value (4) are frozen kernel UAPI, so call through
  * the syscall layer as the final fallback. */
 #if MEMENTO_PLATFORM_POSIX && defined(__linux__) && defined(SYS_madvise)
+#ifdef __THROW
+extern long syscall(long number, ...) __THROW;
+#else
 extern long syscall(long number, ...);
+#endif
+#endif
+
+#if MEMENTO_PLATFORM_POSIX && defined(__linux__)
+#ifndef MADV_COLLAPSE
+#define MADV_COLLAPSE 25
+#endif
+/* 1 = try, 0 = this kernel rejected MADV_COLLAPSE. Process-wide. */
+static int memento_collapse_supported = 1;
+
+static void memento_span_collapse_once(memento_span_t* s) {
+    long rc;
+    if (!memento_collapse_supported || !s || s->collapsed) return;
+    s->collapsed = 1;
+    /* One attempt per span. EINVAL/ENOSYS (Linux < 6.1) retires the hint. */
+#if defined(SYS_madvise)
+    rc = syscall(SYS_madvise, s, (size_t)MEMENTO_SPAN_SIZE, MADV_COLLAPSE);
+#else
+    rc = madvise(s, (size_t)MEMENTO_SPAN_SIZE, MADV_COLLAPSE);
+#endif
+    if (rc != 0 && (errno == EINVAL || errno == ENOSYS)) {
+        memento_collapse_supported = 0;
+    } else if (rc != 0) {
+        s->collapsed = 0;
+    }
+}
 #endif
 static void memento_os_discard(void* ptr, size_t len) {
     (void)ptr;
@@ -2242,6 +2433,9 @@ static memento_span_t* memento_span_create(memento_thread_heap_t* owner) {
     span->reclaimed = 0;
     span->purge_at = 0;
     span->zero_from = 0; /* fresh mmap: the whole data region is zero */
+#if MEMENTO_STATS
+    owner->stats.span_claims++;
+#endif
     /* Align first block to 16 bytes (header may leave data misaligned) */
     {
         uintptr_t data = (uintptr_t)span->data;
@@ -2343,7 +2537,7 @@ static void memento_span_purge_stale(memento_thread_heap_t* heap, uint64_t now) 
     }
 }
 
-static void memento_span_reclaim(memento_thread_heap_t* heap,
+void memento_span_reclaim(memento_thread_heap_t* heap,
                                  memento_span_t* span, size_t sc) {
 #if MEMENTO_DEBUG && !MEMENTO_PAGE_SIZE
     if (span->live != 0) memento_debug_fail("span reclaim with live blocks");
@@ -2521,6 +2715,7 @@ static void memento_page_reset(memento_page_t* pg, uint8_t sc) {
 
 static void memento_page_drain(memento_page_t* pg) {
     if (!pg) return;
+    memento_thread_heap_t* owner = memento_span_of(pg)->owner;
     memento_foreign_node_t* n =
         (memento_foreign_node_t*)memento_atomic_ptr_exchange_acq(&pg->thread_free, NULL);
     while (n) {
@@ -2537,6 +2732,9 @@ static void memento_page_drain(memento_page_t* pg) {
             }
         }
         n = next;
+#if MEMENTO_STATS
+        if (owner) owner->stats.foreign_free_count++;
+#endif
     }
 }
 
@@ -2567,6 +2765,9 @@ static memento_page_t* memento_page_acquire(memento_thread_heap_t* heap, size_t 
         memento_page_drain(cand);
         if (cand->free || memento_bmp_first(cand->bmp, (int)((cand->nbits + 63u) / 64u)) >= 0) {
             heap->active[sc] = cand;
+#if MEMENTO_STATS
+            heap->stats.page_claims++;
+#endif
             return cand;
         }
     }
@@ -2731,6 +2932,7 @@ static void memento_heap_track_free(memento_thread_heap_t* heap, size_t block_si
     }
 }
 
+    #ifndef MEMENTO_STAT_ALLOC
     #define MEMENTO_STAT_ALLOC(heap, sc, bs) do { \
         (heap)->stats.alloc_count++; \
         (heap)->class_live[sc]++; \
@@ -2740,6 +2942,7 @@ static void memento_heap_track_free(memento_thread_heap_t* heap, size_t block_si
         (heap)->stats.free_count++; \
         if ((heap)->class_live[sc]) (heap)->class_live[sc]--; \
         memento_heap_track_free((heap), (bs)); } while (0)
+    #endif
 
     #define MEMENTO_STAT_ALLOC_LARGE(heap, bs) do { \
         (heap)->stats.alloc_count++; \
@@ -2921,7 +3124,7 @@ MEMENTO_FORCE_INLINE uint8_t memento_kind_for_total(size_t total) {
 /* Slow path: cache miss or large allocation. Kept out-of-line so the hot
  * path stays tiny and I-cache friendly. *out_fresh (when given) reports a
  * kernel-zeroed block. */
-static MEMENTO_NOINLINE void* memento_slow_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap,
+MEMENTO_NOINLINE void* memento_slow_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap,
                                                    size_t size, size_t sc, bool* out_fresh) {
     if (MEMENTO_LIKELY(size <= MEMENTO_MAX_SIZE_CLASS)) {
         void* ptr = memento_refill_size_class(heap, sc, out_fresh);
@@ -2955,14 +3158,20 @@ static MEMENTO_NOINLINE void* memento_slow_alloc(memento_thread_heap_t* MEMENTO_
  * size == 0 is NOT special: it lands in the smallest class, so every mode
  * (exact, sized, shim) returns a unique, freeable pointer — the glibc
  * behaviour real code already depends on. */
-MEMENTO_FORCE_INLINE void* memento_fast_alloc(memento_thread_heap_t* MEMENTO_RESTRICT heap,
-                                               size_t size, bool* out_fresh) {
+MEMENTO_NOINLINE void* memento_fast_alloc_miss(memento_thread_heap_t* MEMENTO_RESTRICT heap,
+                                               size_t size, size_t sc, bool* out_fresh) {
     if (MEMENTO_UNLIKELY(heap == NULL)) {
         return NULL;
     }
+    {
+        static MEMENTO_TLS uint32_t decay;
+        if ((++decay & 63u) == 0) {
+            memento_span_purge_stale(heap, memento_now_ms());
+        }
+    }
 
     if (MEMENTO_LIKELY(size <= MEMENTO_MAX_SIZE_CLASS)) {
-        size_t sc = memento_size_class_for(size);
+        /* `sc` already computed by the public inline. */
 #if MEMENTO_PAGE_SIZE
         memento_tcache_bin_t* MEMENTO_RESTRICT bin = &heap->tcache[sc];
         if (MEMENTO_LIKELY(bin->top > 1)) {
@@ -2977,6 +3186,9 @@ MEMENTO_FORCE_INLINE void* memento_fast_alloc(memento_thread_heap_t* MEMENTO_RES
         }
         memento_page_t* MEMENTO_RESTRICT pg = heap->active[sc];
         if (MEMENTO_LIKELY(pg != NULL && pg->free != NULL)) {
+#if MEMENTO_STATS
+            heap->stats.page_hits++;
+#endif
             /* Miss: pack up to 8 from the page into the tcache, then pop. */
             uint32_t n = 1;
             {
@@ -3065,36 +3277,12 @@ MEMENTO_FORCE_INLINE void* memento_fast_alloc(memento_thread_heap_t* MEMENTO_RES
     return memento_slow_alloc(heap, size, 0, out_fresh);
 }
 
-/* Exact-size allocation entry used by every internal consumer. */
-MEMENTO_FORCE_INLINE void* memento_alloc_exact(memento_thread_heap_t* heap, size_t size) {
-    return memento_fast_alloc(heap, size, NULL);
-}
-
-/* Freelist push for size-class blocks (LUT mirrored from alloc).
- *
- * The cache limit is honored on free, not just on refill: a block freed past
- * the limit is dropped — poisoned and left inside its span, reusable only
- * when the span empties and is recycled. Unbounded freelists are how "thread
- * allocates 2 GiB of 64-byte nodes, frees them all" turns into permanent RSS;
- * the span live-counter is the release valve: when no block of a span is in
- * user hands (foreign in-flight blocks count as live until drained), every
- * block is on the freelist or dropped, so the whole span goes back. */
-MEMENTO_FORCE_INLINE void memento_free_size_class(memento_thread_heap_t* MEMENTO_RESTRICT heap,
+MEMENTO_NOINLINE void memento_free_size_class_miss(memento_thread_heap_t* MEMENTO_RESTRICT heap,
                                                     void* MEMENTO_RESTRICT ptr, size_t size) {
     size_t sc = memento_size_class_for(size);
     size_t block_size = memento_size_class_to_size(sc);
-
-    MEMENTO_VALGRIND_FREELIKE(ptr);
-    memento_debug_on_free(ptr);
 #if MEMENTO_PAGE_SIZE
     memento_tcache_bin_t* bin = &heap->tcache[sc];
-    if (MEMENTO_LIKELY(bin->top < memento_tcache_depth())) {
-        bin->slot[bin->top++] = ptr;
-        MEMENTO_ASAN_POISON(ptr, block_size);
-        MEMENTO_STAT_FREE(heap, sc, block_size);
-        return;
-    }
-    /* Spill 8 back to their home pages, keep the rest, then push. */
     {
         uint32_t i;
         for (i = 0; i < 8 && bin->top > 1; i++) {
@@ -3118,7 +3306,8 @@ MEMENTO_FORCE_INLINE void memento_free_size_class(memento_thread_heap_t* MEMENTO
     MEMENTO_STAT_FREE(heap, sc, block_size);
     {
     memento_page_t* pg = memento_page_of(ptr);
-    if (MEMENTO_UNLIKELY(pg->nused == 0 && heap->active[pg->sc] != pg)) {
+    if (MEMENTO_UNLIKELY(pg->nused == 0 && heap->active[pg->sc] != pg
+                         && heap->tcache[pg->sc].top <= 1)) {
         memento_span_t* span = memento_span_of(ptr);
         int busy = 0;
         unsigned i;
@@ -3156,17 +3345,12 @@ MEMENTO_FORCE_INLINE void memento_free_size_class(memento_thread_heap_t* MEMENTO
 #endif
 }
 
-static void memento_heap_free_local(memento_thread_heap_t* MEMENTO_RESTRICT heap,
-                                     void* MEMENTO_RESTRICT ptr, size_t size) {
+void memento_heap_free_local(memento_thread_heap_t* MEMENTO_RESTRICT heap,
+                             void* MEMENTO_RESTRICT ptr, size_t size) {
     if (MEMENTO_LIKELY(size <= MEMENTO_MAX_SIZE_CLASS)) {
-        /* Span-backed small block. */
         memento_free_size_class(heap, ptr, size);
         return;
     }
-
-    /* Large tiers: the meta header is the source of truth for the mapping's
-     * extent, not the caller's size. An exact-mode free with a wrong size
-     * still unmaps (or caches) the right number of pages. */
     memento_large_meta_t* meta =
         (memento_large_meta_t*)((char*)ptr - MEMENTO_LARGE_META_SIZE);
     MEMENTO_VALGRIND_FREELIKE(ptr);
@@ -3174,8 +3358,6 @@ static void memento_heap_free_local(memento_thread_heap_t* MEMENTO_RESTRICT heap
     if (MEMENTO_UNLIKELY(meta->magic != MEMENTO_LARGE_MAGIC || meta->pages == 0)) {
         memento_debug_fail("large free: corrupt or missing meta header");
     }
-    /* The caller's size may undershoot meta->pages legitimately (realloc
-     * shrink hysteresis keeps the mapping); it may never overshoot it. */
     if (MEMENTO_UNLIKELY(memento_page_run_pages_for(size) > meta->pages)) {
         memento_debug_fail("exact-mode free with wrong size");
     }
@@ -3186,32 +3368,6 @@ static void memento_heap_free_local(memento_thread_heap_t* MEMENTO_RESTRICT heap
         memento_huge_free(heap, ptr, meta);
     }
     MEMENTO_STAT_FREE_LARGE(heap, size);
-}
-
-/* Exact-size free on the heap that owns the block (routing already done). */
-MEMENTO_FORCE_INLINE void memento_free_exact(memento_thread_heap_t* heap,
-                                             void* ptr, size_t size) {
-    if (MEMENTO_UNLIKELY(ptr == NULL || heap == NULL)) {
-        return;
-    }
-    if (MEMENTO_UNLIKELY(heap != memento_tls_heap)) {
-#if MEMENTO_PAGE_SIZE
-        if (size <= MEMENTO_MAX_SIZE_CLASS) {
-            memento_page_t* pg = memento_page_of(ptr);
-            memento_foreign_node_t* node = (memento_foreign_node_t*)ptr;
-            memento_debug_on_foreign_free(ptr);
-            node->size = size;
-            void* head = memento_atomic_ptr_load_relaxed(&pg->thread_free);
-            do {
-                node->next = (memento_foreign_node_t*)head;
-            } while (!memento_atomic_ptr_cas_release(&pg->thread_free, head, (void*)node));
-            return;
-        }
-#endif
-        memento_foreign_push(heap, ptr, size);
-        return;
-    }
-    memento_heap_free_local(heap, ptr, size);
 }
 
 /* ============================================================================
@@ -3378,55 +3534,77 @@ void* memento_heap_calloc(memento_thread_heap_t* heap, size_t count, size_t size
     return user;
 }
 
-/* Resolve the owning heap from the pointer and hand the block back — to the
- * local freelist if we own it, to the owner's MPSC stack if we don't. This is
- * what makes memento_free(p) a correct cross-thread free. */
+/* Resolve the owning heap from the pointer and hand the block back.
+ * Pagemap is the gate for small blocks — the 16-bit header magic is a
+ * debug canary, not discovery. An espresso-style smashed header must
+ * still free. Remote small frees go on the page's thread_free (same
+ * overlay at slot start as the exact path), not the heap-wide stack. */
 static void memento_sized_free_routed(void* ptr) {
     if (MEMENTO_UNLIKELY(ptr == NULL)) return;
-    MEMENTO_ASAN_UNPOISON((char*)ptr - MEMENTO_SIZED_HEADER_SIZE,
-                          MEMENTO_SIZED_HEADER_SIZE);
-    memento_sized_hdr_t* hdr =
-        (memento_sized_hdr_t*)((char*)ptr - MEMENTO_SIZED_HEADER_SIZE);
-    if (MEMENTO_UNLIKELY(!memento_sized_hdr_ok(hdr, ptr))) {
-        /* Debug: scream. Release: no-op. memento_free is sized-only; exact
-         * pointers go through memento_thread_heap_free. A coincidental
-         * 0x4D53 in foreign memory must not be trusted as a header. */
-#if MEMENTO_DEBUG
-        memento_debug_fail("memento_free of a non-sized (or corrupt) pointer");
-#endif
-        return;
-    }
 
-    void* raw = (char*)ptr - hdr->back_off;
-    size_t total = memento_sized_total(hdr);
-    memento_thread_heap_t* owner;
-
-    if (hdr->kind == MEMENTO_KIND_SMALL) {
 #if MEMENTO_PAGE_SIZE
-        if (!memento_pagemap_lookup(raw)) {
-#if MEMENTO_DEBUG
-            memento_debug_fail("memento_free of a pointer not in the pagemap");
+    {
+        memento_page_t* pg = memento_pagemap_lookup(ptr);
+        if (pg && pg->sc < MEMENTO_SIZE_CLASS_COUNT) {
+            size_t bs = memento_size_class_to_size(pg->sc);
+            char* payload = (char*)pg + memento_page_payload_off();
+            if (bs && (char*)ptr >= payload) {
+                size_t off = (size_t)((char*)ptr - payload);
+                unsigned idx = (unsigned)(off / bs);
+                if (idx < pg->nbits && !memento_bmp_test(pg->bmp, idx)) {
+                    void* raw = payload + (size_t)idx * bs;
+                    size_t total = bs;
+                    memento_thread_heap_t* owner = memento_span_of(raw)->owner;
+                    MEMENTO_ASAN_UNPOISON(raw, MEMENTO_SIZED_HEADER_SIZE);
+                    memento_sized_hdr_t* hdr = (memento_sized_hdr_t*)raw;
+                    if (memento_sized_hdr_ok(hdr, (char*)raw + hdr->back_off)) {
+                        total = memento_sized_total(hdr);
+                        hdr->magic = 0;
+                    }
+                    MEMENTO_VALGRIND_FREELIKE(ptr);
+                    if (MEMENTO_LIKELY(owner == memento_tls_heap)) {
+                        memento_heap_free_local(owner, raw, total);
+                    } else if (owner) {
+                        memento_foreign_node_t* node = (memento_foreign_node_t*)raw;
+                        memento_debug_on_foreign_free(raw);
+                        node->size = total;
+                        void* head = memento_atomic_ptr_load_relaxed(&pg->thread_free);
+                        do {
+                            node->next = (memento_foreign_node_t*)head;
+                        } while (!memento_atomic_ptr_cas_release(&pg->thread_free, head, (void*)node));
+                    }
+                    return;
+                }
+            }
+        }
+    }
 #endif
+
+    /* Large / page-run: 64-bit meta, not a 16-bit sniff.
+     * Sized layout is [meta 32][hdr 16][user]; exact is [meta 32][user]. */
+    {
+        memento_large_meta_t* meta = (memento_large_meta_t*)
+            ((char*)ptr - MEMENTO_SIZED_HEADER_SIZE - MEMENTO_LARGE_META_SIZE);
+        void* raw = (char*)ptr - MEMENTO_SIZED_HEADER_SIZE;
+        if (meta->magic != MEMENTO_LARGE_MAGIC) {
+            meta = (memento_large_meta_t*)((char*)ptr - MEMENTO_LARGE_META_SIZE);
+            raw = ptr;
+        }
+        if (meta->magic == MEMENTO_LARGE_MAGIC && meta->pages != 0 && meta->owner) {
+            MEMENTO_VALGRIND_FREELIKE(ptr);
+            memento_thread_heap_t* owner = meta->owner;
+            if (MEMENTO_LIKELY(owner == memento_tls_heap)) {
+                memento_heap_free_local(owner, raw, (size_t)meta->user_size);
+            } else {
+                memento_foreign_push(owner, raw, (size_t)meta->user_size);
+            }
             return;
         }
+    }
+
+#if MEMENTO_DEBUG
+    memento_debug_fail("memento_free of a pointer not in the pagemap");
 #endif
-        owner = memento_span_of(raw)->owner;
-    } else {
-        memento_large_meta_t* meta =
-            (memento_large_meta_t*)((char*)raw - MEMENTO_LARGE_META_SIZE);
-        owner = meta->owner;
-    }
-
-    MEMENTO_VALGRIND_FREELIKE(ptr);
-    hdr->magic = 0; /* double-free through the sized path now fails the check */
-
-    if (MEMENTO_LIKELY(owner == memento_tls_heap)) {
-        memento_heap_free_local(owner, raw, total);
-    } else if (owner) {
-        memento_foreign_push(owner, raw, total);
-    }
-    /* owner == NULL: heap already released (shutdown) — block leaks, but the
-     * mapping it lived in went back to the OS with the heap anyway. */
 }
 
 void memento_heap_mfree(memento_thread_heap_t* heap, void* ptr) {
@@ -3436,21 +3614,53 @@ void memento_heap_mfree(memento_thread_heap_t* heap, void* ptr) {
 
 size_t memento_heap_usable_size(const void* ptr) {
     if (!ptr) return 0;
-    const memento_sized_hdr_t* hdr =
-        (const memento_sized_hdr_t*)((const char*)ptr - MEMENTO_SIZED_HEADER_SIZE);
-    if (MEMENTO_UNLIKELY(!memento_sized_hdr_ok(hdr, ptr))) return 0;
-    size_t total = memento_sized_total(hdr);
-    size_t capacity;
-    if (hdr->kind == MEMENTO_KIND_SMALL) {
-        capacity = memento_size_class_to_size(memento_size_class_for(total));
-    } else {
-        /* Large tiers: the mapping's page count is the truth (realloc
-         * shrink hysteresis may leave hdr->size below the mapping). */
-        const memento_large_meta_t* meta = (const memento_large_meta_t*)
-            ((const char*)ptr - hdr->back_off - MEMENTO_LARGE_META_SIZE);
-        capacity = ((size_t)meta->pages << 12) - MEMENTO_LARGE_META_SIZE;
+    /* Intact header is a fast path (aligned_alloc back_off is not 16). */
+    {
+        const memento_sized_hdr_t* hdr =
+            (const memento_sized_hdr_t*)((const char*)ptr - MEMENTO_SIZED_HEADER_SIZE);
+        if (memento_sized_hdr_ok(hdr, ptr)) {
+            size_t back = hdr->back_off;
+            if (hdr->kind == MEMENTO_KIND_SMALL) {
+                size_t total = memento_sized_total(hdr);
+                size_t cap = memento_size_class_to_size(memento_size_class_for(total));
+                return (cap > back) ? (cap - back) : 0;
+            }
+            const memento_large_meta_t* meta = (const memento_large_meta_t*)
+                ((const char*)ptr - back - MEMENTO_LARGE_META_SIZE);
+            if (meta->magic == MEMENTO_LARGE_MAGIC && meta->pages != 0) {
+                size_t cap = ((size_t)meta->pages << 12) - MEMENTO_LARGE_META_SIZE;
+                return (cap > back) ? (cap - back) : 0;
+            }
+        }
     }
-    return (capacity > hdr->back_off) ? (capacity - hdr->back_off) : 0;
+#if MEMENTO_PAGE_SIZE
+    {
+        memento_page_t* pg = memento_pagemap_lookup(ptr);
+        if (pg && pg->sc < MEMENTO_SIZE_CLASS_COUNT) {
+            size_t bs = memento_size_class_to_size(pg->sc);
+            char* payload = (char*)pg + memento_page_payload_off();
+            if (bs && (const char*)ptr >= payload) {
+                size_t off = (size_t)((const char*)ptr - payload);
+                unsigned idx = (unsigned)(off / bs);
+                if (idx < pg->nbits) {
+                    void* raw = payload + (size_t)idx * bs;
+                    size_t back = (size_t)((const char*)ptr - (const char*)raw);
+                    if (back >= bs) back = MEMENTO_SIZED_HEADER_SIZE;
+                    return (bs > back) ? (bs - back) : 0;
+                }
+            }
+        }
+    }
+#endif
+    {
+        const memento_large_meta_t* meta =
+            (const memento_large_meta_t*)((const char*)ptr - MEMENTO_LARGE_META_SIZE);
+        if (meta->magic == MEMENTO_LARGE_MAGIC && meta->pages != 0) {
+            size_t capacity = ((size_t)meta->pages << 12) - MEMENTO_LARGE_META_SIZE;
+            return capacity;
+        }
+    }
+    return 0;
 }
 
 void* memento_heap_realloc(memento_thread_heap_t* heap, void* ptr, size_t new_size) {
@@ -3471,29 +3681,63 @@ void* memento_heap_realloc(memento_thread_heap_t* heap, void* ptr, size_t new_si
      *    whenever the new request still fits it and doesn't drop below half
      *    of the old one — tcmalloc-style hysteresis; a 200K->100K shrink
      *    keeps its pages instead of munmap + mmap + 100K memcpy. */
-    memento_sized_hdr_t* hdr =
-        (memento_sized_hdr_t*)((char*)ptr - MEMENTO_SIZED_HEADER_SIZE);
-    size_t old_total = memento_sized_total(hdr);
-    size_t extra = (hdr->align_log2 > 4) ? ((size_t)1 << hdr->align_log2) : 0;
+    size_t extra = 0;
+    size_t old_total = 0;
+    uint8_t kind = MEMENTO_KIND_SMALL;
+    memento_sized_hdr_t* hdr = NULL;
+#if MEMENTO_PAGE_SIZE
+    memento_page_t* pg = memento_pagemap_lookup(ptr);
+    if (pg && pg->sc < MEMENTO_SIZE_CLASS_COUNT) {
+        size_t bs = memento_size_class_to_size(pg->sc);
+        char* payload = (char*)pg + memento_page_payload_off();
+        if (bs && (char*)ptr >= payload) {
+            unsigned idx = (unsigned)((size_t)((char*)ptr - payload) / bs);
+            if (idx < pg->nbits) {
+                void* raw = payload + (size_t)idx * bs;
+                hdr = (memento_sized_hdr_t*)raw;
+                extra = (hdr->align_log2 > 4) ? ((size_t)1 << hdr->align_log2) : 0;
+                old_total = bs;
+                kind = MEMENTO_KIND_SMALL;
+            }
+        }
+    } else
+#endif
+    {
+        memento_large_meta_t* meta = (memento_large_meta_t*)
+            ((char*)ptr - MEMENTO_SIZED_HEADER_SIZE - MEMENTO_LARGE_META_SIZE);
+        if (meta->magic != MEMENTO_LARGE_MAGIC) {
+            meta = (memento_large_meta_t*)((char*)ptr - MEMENTO_LARGE_META_SIZE);
+        }
+        if (meta->magic == MEMENTO_LARGE_MAGIC) {
+            old_total = (size_t)meta->pages << 12;
+            kind = (meta->pages <= MEMENTO_PAGE_RUN_CLASSES)
+                ? MEMENTO_KIND_PAGE_RUN : MEMENTO_KIND_HUGE;
+            hdr = (memento_sized_hdr_t*)((char*)ptr - MEMENTO_SIZED_HEADER_SIZE);
+        }
+    }
     if (MEMENTO_UNLIKELY(new_size > SIZE_MAX - MEMENTO_SIZED_HEADER_SIZE - extra)) {
         return NULL;
     }
     size_t new_total = new_size + MEMENTO_SIZED_HEADER_SIZE + extra;
     bool in_place;
-    if (hdr->kind == MEMENTO_KIND_SMALL && new_total <= MEMENTO_MAX_SIZE_CLASS) {
+    if (kind == MEMENTO_KIND_SMALL && new_total <= MEMENTO_MAX_SIZE_CLASS && old_total) {
         in_place = memento_size_class_for(old_total)
                 == memento_size_class_for(new_total);
-    } else if (hdr->kind != MEMENTO_KIND_SMALL && new_total > MEMENTO_MAX_SIZE_CLASS) {
-        const memento_large_meta_t* meta = (const memento_large_meta_t*)
-            ((const char*)ptr - hdr->back_off - MEMENTO_LARGE_META_SIZE);
+    } else if (kind != MEMENTO_KIND_SMALL && new_total > MEMENTO_MAX_SIZE_CLASS) {
+        memento_large_meta_t* meta = (memento_large_meta_t*)
+            ((char*)ptr - MEMENTO_SIZED_HEADER_SIZE - MEMENTO_LARGE_META_SIZE);
+        if (meta->magic != MEMENTO_LARGE_MAGIC) {
+            meta = (memento_large_meta_t*)((char*)ptr - MEMENTO_LARGE_META_SIZE);
+        }
         size_t need_pages = memento_page_run_pages_for(new_total);
-        in_place = need_pages <= meta->pages
+        in_place = meta->magic == MEMENTO_LARGE_MAGIC
+                && need_pages <= meta->pages
                 && (new_total >= old_total / 2 || need_pages == meta->pages);
     } else {
-        in_place = false; /* tier crossing: small->large or large->small */
+        in_place = false;
     }
     if (in_place) {
-        hdr->size = new_size;
+        if (hdr) hdr->size = new_size;
         return ptr;
     }
 
@@ -3518,29 +3762,21 @@ void* memento_calloc(size_t count, size_t size) {
 
 void* memento_realloc(void* ptr, size_t new_size) {
     if (ptr) {
-        /* Route via the owning heap so a cross-thread realloc stays correct. */
-        const memento_sized_hdr_t* hdr =
-            (const memento_sized_hdr_t*)((const char*)ptr - MEMENTO_SIZED_HEADER_SIZE);
-        if (MEMENTO_UNLIKELY(!memento_sized_hdr_ok(hdr, ptr))) {
-            /* Not ours. Debug: scream. Release: return NULL — the realloc
-             * contract leaves the original pointer valid, so a libc-foreign
-             * block survives untouched and the caller keeps working. */
-#if MEMENTO_DEBUG
-            memento_debug_fail("memento_realloc of a non-sized (or corrupt) pointer");
+        memento_thread_heap_t* owner = memento_tls_heap;
+#if MEMENTO_PAGE_SIZE
+        memento_page_t* pg = memento_pagemap_lookup(ptr);
+        if (pg) {
+            owner = memento_span_of(ptr)->owner;
+        } else
 #endif
-            return NULL;
+        {
+            memento_large_meta_t* meta =
+                (memento_large_meta_t*)((char*)ptr - MEMENTO_LARGE_META_SIZE);
+            if (meta->magic == MEMENTO_LARGE_MAGIC) {
+                owner = meta->owner;
+            }
         }
-        memento_thread_heap_t* owner;
-        if (hdr->kind == MEMENTO_KIND_SMALL) {
-            owner = memento_span_of((const char*)ptr - hdr->back_off)->owner;
-        } else {
-            owner = ((memento_large_meta_t*)
-                     ((const char*)ptr - hdr->back_off - MEMENTO_LARGE_META_SIZE))->owner;
-        }
-        if (MEMENTO_UNLIKELY(owner != memento_tls_heap)) {
-            /* Not ours: allocate here, copy, foreign-free the old block.
-             * thread_heap_get() (not the raw TLS slot) because this may be
-             * this thread's very first memento call. */
+        if (MEMENTO_UNLIKELY(owner != memento_tls_heap && owner != NULL)) {
             size_t usable = memento_heap_usable_size(ptr);
             void* new_ptr = memento_heap_malloc(memento_thread_heap_get(), new_size);
             if (new_ptr) {
@@ -3548,6 +3784,12 @@ void* memento_realloc(void* ptr, size_t new_size) {
                 memento_sized_free_routed(ptr);
             }
             return new_ptr;
+        }
+        if (!owner) {
+#if MEMENTO_DEBUG
+            memento_debug_fail("memento_realloc of a pointer not in the pagemap");
+#endif
+            return NULL;
         }
         return memento_heap_realloc(owner, ptr, new_size);
     }
@@ -3628,15 +3870,6 @@ void memento_thread_heap_free_aligned(memento_thread_heap_t* heap, void* ptr,
 }
 
 #else /* MEMENTO_EXACT_SIZE */
-
-MEMENTO_ATTR_FLATTEN
-void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size) {
-    return memento_alloc_exact(heap, size);
-}
-
-void memento_thread_heap_free(memento_thread_heap_t* heap, void* ptr, size_t size) {
-    memento_free_exact(heap, ptr, size);
-}
 
 void* memento_thread_heap_realloc(memento_thread_heap_t* heap, void* ptr,
                                    size_t old_size, size_t new_size) {
@@ -4944,6 +5177,20 @@ static size_t memento_heap_foreign_pending(memento_thread_heap_t* heap) {
         n++;
         node = node->next;
     }
+#if MEMENTO_PAGE_SIZE
+    for (memento_span_t* s = heap->span_list; s; s = s->next) {
+        unsigned i;
+        for (i = 1; i < MEMENTO_PAGES_PER_SPAN; i++) {
+            memento_page_t* pg = memento_span_page_at(s, i);
+            memento_foreign_node_t* p =
+                (memento_foreign_node_t*)memento_atomic_ptr_load_relaxed(&pg->thread_free);
+            while (p) {
+                n++;
+                p = p->next;
+            }
+        }
+    }
+#endif
     return n;
 }
 
@@ -5046,16 +5293,67 @@ void memento_report_all(FILE* out) {
  * Global Initialization
  * ============================================================================ */
 
-void memento_heap_release_caches(memento_thread_heap_t* heap) {
-    /* Size-class freelist nodes live inside spans — drop the lists, then unmap. */
-    for (int i = 0; i < MEMENTO_SIZE_CLASS_COUNT; i++) {
-        heap->caches[i].head = NULL;
-        heap->caches[i].count = 0;
+/* Drop `span` out of the parked-span stack, if it is on it. */
+static void memento_span_free_unlink(memento_thread_heap_t* heap, memento_span_t* span) {
+    memento_span_t** p = &heap->span_free;
+    while (*p) {
+        if (*p == span) {
+            *p = span->free_next;
+            span->free_next = NULL;
+            if (heap->span_free_count) heap->span_free_count--;
+            return;
+        }
+        p = &(*p)->free_next;
+    }
+}
+
+static int memento_span_has_live(memento_span_t* span) {
 #if MEMENTO_PAGE_SIZE
-        heap->tcache[i].top = 1;
-        heap->active[i] = NULL;
+    unsigned pi;
+    for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
+        memento_page_t* pg = memento_span_page_at(span, pi);
+        memento_page_drain(pg);
+        if (pg->nused) return 1;
+    }
+    return 0;
+#else
+    return span->live != 0;
+#endif
+}
+
+/* Freelist nodes live in the span. Unlink them before the mapping goes away. */
+static void memento_cache_forget_span(memento_thread_heap_t* heap, memento_span_t* span) {
+    int sc;
+    for (sc = 0; sc < MEMENTO_SIZE_CLASS_COUNT; sc++) {
+        void** pp = &heap->caches[sc].head;
+        void* n = heap->caches[sc].head;
+        while (n) {
+            MEMENTO_ASAN_UNPOISON(n, sizeof(void*));
+            void* next = *(void**)n;
+            if (memento_span_of(n) == span) {
+                *pp = next;
+                if (heap->caches[sc].count) heap->caches[sc].count--;
+            } else {
+                MEMENTO_ASAN_POISON(n, sizeof(void*));
+                pp = (void**)n;
+            }
+            n = next;
+        }
+        if (heap->span_partial[sc] == span) heap->span_partial[sc] = NULL;
+#if MEMENTO_PAGE_SIZE
+        if (heap->active[sc] && memento_span_of(heap->active[sc]) == span) {
+            heap->active[sc] = NULL;
+        }
 #endif
     }
+}
+
+void memento_heap_release_caches(memento_thread_heap_t* heap) {
+    if (!heap) return;
+    /* Spill tcaches first so nused/live reflect blocks the user still holds.
+     * Dropping the tcache without a flush would both leak those blocks and
+     * make an idle span look busy. */
+    memento_thread_heap_flush(heap);
 
     /* Page-run cache → OS */
     for (uint32_t i = 0; i < MEMENTO_PAGE_RUN_CLASSES; i++) {
@@ -5082,28 +5380,31 @@ void memento_heap_release_caches(memento_thread_heap_t* heap) {
     heap->large_count = 0;
     heap->stats.huge_cached = 0;
 
-    /* Unmap every span (span_free spans are on span_list too) */
-    memento_span_t* span = heap->span_list;
-    heap->span_list = NULL;
-    heap->span_free = NULL;
-    heap->span_free_count = 0;
-    for (int i = 0; i < MEMENTO_SIZE_CLASS_COUNT; i++) {
-        heap->span_partial[i] = NULL;
-    }
-    while (span) {
-        memento_span_t* next = span->next;
-#if MEMENTO_PAGE_SIZE
-        {
-            unsigned pi;
-            for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
-                memento_pagemap_clear(memento_span_page_at(span, pi));
+    /* Unmap spans with nothing in user hands. Live spans stay mapped —
+     * release_caches is safe to call with outstanding allocations. */
+    {
+        memento_span_t** pp = &heap->span_list;
+        while (*pp) {
+            memento_span_t* span = *pp;
+            if (memento_span_has_live(span)) {
+                pp = &span->next;
+                continue;
             }
-        }
+            *pp = span->next;
+            memento_span_free_unlink(heap, span);
+            memento_cache_forget_span(heap, span);
+#if MEMENTO_PAGE_SIZE
+            {
+                unsigned pi;
+                for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
+                    memento_pagemap_clear(memento_span_page_at(span, pi));
+                }
+            }
 #endif
-        memento_os_free(span, MEMENTO_SPAN_SIZE);
-        span = next;
+            memento_os_free(span, MEMENTO_SPAN_SIZE);
+            if (heap->stats.span_count) heap->stats.span_count--;
+        }
     }
-    heap->stats.span_count = 0;
 }
 
 void memento_malloc_trim(void) {
@@ -5123,6 +5424,10 @@ void memento_malloc_trim(void) {
     {
         memento_thread_heap_t* heap = memento_heap_registry;
         while (heap) {
+            /* Parked spans only. Do not DONTNEED pages of span_partial:
+             * the page header (freelist, bitmap, nused) lives at the base
+             * of each 64 KiB page, and discarding it makes a reusable page
+             * look fully allocated. The next refill then abandons the span. */
             memento_span_purge_stale(heap, ~(uint64_t)0);
             heap = heap->registry_next;
         }

@@ -200,7 +200,21 @@ int main(int argc, char** argv) {
     bench_churn("churn-1KiB", 1024, 1000000 / k);
     bench_bulk("bulk-64B", 64, 100000 / k);
     bench_bulk("bulk-4KiB", 4096, 20000 / k);
+#if defined(ALLOC_MIMENTO3) && MEMENTO_STATS
+    {
+        memento_heap_stats_t before, after;
+        memento_thread_heap_stats(g_heap, &before);
+        bench_mixed("mixed-16-256B", 50000 / k);
+        memento_thread_heap_stats(g_heap, &after);
+        printf("  mixed counters              tcache=%zu page=%zu claim_page=%zu claim_span=%zu\n",
+               after.tcache_hits - before.tcache_hits,
+               after.page_hits - before.page_hits,
+               after.page_claims - before.page_claims,
+               after.span_claims - before.span_claims);
+    }
+#else
     bench_mixed("mixed-16-256B", 50000 / k);
+#endif
     bench_churn("churn-16KiB", 16384, 20000 / k);
     bench_threads("threads-4x-64B", 4, 500000 / k);
 

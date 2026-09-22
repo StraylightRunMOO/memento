@@ -92,6 +92,15 @@ static void memento_boot_free_aligned(void* ptr) {
 #define MEMENTO_ALIGNED_ALLOC(a, s)     memento_boot_aligned((a), (s))
 #define MEMENTO_ALIGNED_FREE(ptr)       memento_boot_free_aligned(ptr)
 
+/* Shim: give empty spans back now. 16×2 MiB per heap is how glibc-thread
+ * lands at 368 MiB. Embedders keep the library defaults. */
+#ifndef MEMENTO_SPAN_CACHE_MAX
+    #define MEMENTO_SPAN_CACHE_MAX 2
+#endif
+#ifndef MEMENTO_SPAN_PURGE_MS
+    #define MEMENTO_SPAN_PURGE_MS 0
+#endif
+
 #define MEMENTO_IMPLEMENTATION
 #include "memento.h"
 

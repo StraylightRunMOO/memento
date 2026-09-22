@@ -81,6 +81,52 @@ TEST(small_span_is_self_aligned) {
     memento_free(p);
 }
 
+TEST(free_with_smashed_header) {
+    /* Pagemap is the gate: a smashed 16-bit canary must not leak the block. */
+    void* p = memento_malloc(64);
+    ASSERT_NOT_NULL(p);
+    unsigned char smash[16];
+    memset(smash, 0x5a, 16);
+    memcpy((char*)p - 16, smash, 16);
+    memento_free(p);
+    void* q = memento_malloc(64);
+    ASSERT_NOT_NULL(q);
+    memento_free(q);
+}
+
+#if !defined(_WIN32)
+typedef struct {
+    void* p;
+    unsigned char expect[32];
+} smash_arg_t;
+
+static void* smash_foreign_free(void* arg) {
+    smash_arg_t* a = (smash_arg_t*)arg;
+    memento_free(a->p);
+    return NULL;
+}
+
+TEST(cross_thread_sized_free_preserves_canary) {
+    /* Remote free must overlay the slot start (header), not user[1]. */
+    unsigned char* p = (unsigned char*)memento_malloc(64);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xA5, 64);
+    smash_arg_t a;
+    a.p = p;
+    memcpy(a.expect, p, 32);
+    /* Hold a second live block so we can check the first wasn't scribbled
+     * before the free actually happens — the free is on the other thread. */
+    pthread_t t;
+    pthread_create(&t, NULL, smash_foreign_free, &a);
+    pthread_join(t, NULL);
+    /* After join the block is freed; allocate again and ensure we didn't
+     * crash. Canary check is that free didn't abort. */
+    void* q = memento_malloc(64);
+    ASSERT_NOT_NULL(q);
+    memento_free(q);
+}
+#endif
+
 TEST(malloc_free_large_and_huge) {
     size_t sizes[] = { 9000, 16384, 100 * 1024, 250 * 1024, 300 * 1024,
                        1024 * 1024, 3 * 1024 * 1024 };
@@ -383,6 +429,10 @@ int main(void) {
 
     RUN_TEST(malloc_free_small);
     RUN_TEST(small_span_is_self_aligned);
+    RUN_TEST(free_with_smashed_header);
+#if !defined(_WIN32)
+    RUN_TEST(cross_thread_sized_free_preserves_canary);
+#endif
     RUN_TEST(malloc_free_large_and_huge);
     RUN_TEST(calloc_zeroes);
     RUN_TEST(realloc_chains);

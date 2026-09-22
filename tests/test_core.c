@@ -1136,6 +1136,61 @@ TEST(ctl_tcache_and_mallinfo) {
     memento_malloc_trim();
 }
 
+TEST(trim_does_not_abandon_active_span) {
+    /* malloc_trim used to MADV_DONTNEED every nused==0 page of the active
+     * span, including the page header. The bitmap came back as zeros, so
+     * the page looked fully allocated and the next burst allocated a second
+     * span. Trim may discard parked spans only. */
+    /* Drop idle spans left by earlier tests so the warm-up allocation is
+     * a brand-new span and span_free cannot absorb the next one for free.
+     * 7680 is its own size class. One 64 KiB page holds a handful of those
+     * blocks; forty need several pages of that same span. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    memento_heap_stats_t before, after;
+    memento_thread_heap_flush(heap);
+    memento_heap_release_caches(heap);
+    void* warm = memento_thread_heap_alloc(heap, 7680);
+    ASSERT_NOT_NULL(warm);
+    memset(warm, 0x11, 64);
+    memento_thread_heap_free(heap, warm, 7680);
+    memento_thread_heap_flush(heap);
+    memento_thread_heap_stats(heap, &before);
+    ASSERT(before.span_count >= 1);
+    memento_malloc_trim();
+
+    enum { N = 40 };
+    void* ptrs[N];
+    int i;
+    for (i = 0; i < N; i++) {
+        ptrs[i] = memento_thread_heap_alloc(heap, 7680);
+        ASSERT_NOT_NULL(ptrs[i]);
+        memset(ptrs[i], 0x5A, 64);
+    }
+    memento_thread_heap_stats(heap, &after);
+    for (i = 0; i < N; i++) {
+        ASSERT(((unsigned char*)ptrs[i])[0] == 0x5A);
+        memento_thread_heap_free(heap, ptrs[i], 7680);
+    }
+    ASSERT_EQ(after.span_count, before.span_count);
+}
+
+TEST(release_caches_keeps_live_blocks) {
+    /* release_caches used to unmap every span, including ones the caller
+     * still held. A live block must survive, and the heap must still allocate. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    void* p = memento_thread_heap_alloc(heap, 128);
+    ASSERT_NOT_NULL(p);
+    memset(p, 0xAB, 128);
+    memento_heap_release_caches(heap);
+    ASSERT(((unsigned char*)p)[0] == 0xAB);
+    ASSERT(((unsigned char*)p)[127] == 0xAB);
+    memento_thread_heap_free(heap, p, 128);
+    void* q = memento_thread_heap_alloc(heap, 128);
+    ASSERT_NOT_NULL(q);
+    memset(q, 0xCD, 128);
+    memento_thread_heap_free(heap, q, 128);
+}
+
 TEST(heap_report_smoke) {
     memento_thread_heap_t* heap = memento_thread_heap_get();
     /* NULL heap and NULL stream must not crash */
@@ -1249,6 +1304,8 @@ int main(void) {
     RUN_TEST(span_empty_reclaim);
     RUN_TEST(exact_pointer_memento_free_is_sized_only);
     RUN_TEST(ctl_tcache_and_mallinfo);
+    RUN_TEST(trim_does_not_abandon_active_span);
+    RUN_TEST(release_caches_keeps_live_blocks);
     RUN_TEST(heap_report_smoke);
     
     memento_shutdown();

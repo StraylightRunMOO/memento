@@ -331,7 +331,9 @@ Things we'd take patches for, in rough order of our own interest:
 - Per-CPU heaps and a proper cross-thread ownership-transfer API
 - Expose the per-class freelist cap (64 blocks) as a knob — it's the dial
   between bulk-recycle speed and RSS coming back (see the benchmark table)
-- A `MADV_COLLAPSE` pass for long-lived heaps on Linux 6.1+
+- A `MADV_COLLAPSE` pass for long-lived heaps on Linux 6.1+. Flush tries
+  each span once; `EINVAL`/`ENOSYS` disables it for the process (5.15 does
+  not have the flag).
 - Guard-page arenas everywhere, not just where they're cheap
 - A Windows citizen who cares (the aligned-reservation race deserves better)
 - eBPF hook points in the shim, because why should the kernel have all the fun

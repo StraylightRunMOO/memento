@@ -122,23 +122,37 @@ RSS — `glibc-thread` in particular (368 MiB vs 9–27 MiB) because parked
 spans stay mapped. `malloc-large` matches rpmalloc (both ~7.4 s) and
 trails mimalloc.
 
-The shim is **not allt-clean yet**. On this run:
+The shim is **not allt-clean yet**. `memento_free` is pagemap-first
+now (16-bit magic is a canary, not the gate); smashed-header unit
+tests pass. Remaining skips:
 
-| test | memento (`me` / `me0`) |
+| test | why |
 |---|---|
-| cfrac, alloc-test, glibc-*, cache-scratch, malloc-large | completed |
-| larsonN | `me` crashed (no throughput line); `me0` 24.7 s vs mi 9.9 / rp 10.7 |
-| espresso | SIGSEGV (`memento_free` of a corrupt/non-sized pointer) |
-| mstressN | aborted: "memory corruption at block" (canary) |
-| rptestN | aborted (no ops/sec line) |
-| barnes | everyone fails here (missing input file) |
+| espresso | `MEMENTO_DEBUG`: `memento_free` of a pointer not in the pagemap. Release SIGSEGV in `sm_row_dominance`. Interior/non-malloc free after realloc, still open. |
+| mstressN | `MEMENTO_DEBUG`: double-free cookie. Cross-thread sized free still double-accounts a block. |
+| rptestN / larsonN `me` | same family; `me0` completes larson. |
+| barnes | everyone fails (missing input). Skip-with-reason. |
 
-`me` failed three tests and is omitted from the graphs; `me0` stays
-with two isolated holes. Those sized-path bugs are follow-up, not
-hidden by the plot filter — the CSV still has the raw rows.
+`me` is omitted from the graphs when it fails more than two tests; the
+CSV still has the raw rows.
 
 A VA-bump bug bit the first shim run: `va_bump` aligned the *offset*
 into the reservation instead of the resulting address, so spans were
 not 2 MiB-aligned, `memento_span_of` AND'd into `PROT_NONE`, and
 sized `free` SIGSEGV'd. Exact-API `compare.c` never hit that (it uses
 `page_of`). Fixed; `tests/test_sized.c` now asserts a live span header.
+
+**Hit path is now in the public header.** `memento_thread_heap_alloc` /
+`_free` FORCE_INLINE tcache pop/push in every TU; miss path is
+`memento_fast_alloc_miss` / `memento_free_size_class_miss`. A consumer
+`.c` that only `#include "memento.h"` no longer pays call/ret on churn.
+
+**Shim RSS:** `memento_malloc.c` compiles with `SPAN_CACHE_MAX=2` and
+`SPAN_PURGE_MS=0`. Park purges immediately. `malloc_trim` DONTNEEDs
+unused pages in live spans (keeps the hot page). Decay ticks every 64
+misses.
+
+**Mixed is not claim-dominated.** Quick `compare.c` counters on this box
+(12 500 pairs): `tcache=10536 page=1575 claim_page=33 claim_span=10`.
+Deepening the tcache will not move that row. Leave geometry; the gap
+is elsewhere (class-walk / first-touch / sized header), not page-claim.
