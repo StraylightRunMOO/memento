@@ -216,6 +216,46 @@ TEST(explicit_park_adopt_cycle) {
     memento_free(p);
 }
 
+static void* flush_after_adopt_worker(void* arg) {
+    (void)arg;
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    if (!heap) return (void*)1;
+    void* p = memento_thread_heap_alloc(heap, 128);
+    if (!p) return (void*)1;
+    memset(p, 0x5A, 128);
+    memento_thread_heap_free(heap, p, 128);
+    memento_thread_heap_flush(heap);
+    return NULL;
+}
+
+TEST(shutdown_then_worker_flush) {
+    /* Helper threads park into memento_cpu_heaps[]. shutdown frees those
+     * structs. The next worker's adopt + flush must not follow a dangling
+     * CPU slot (suspenders poll-suite SIGSEGV in memento_page_drain). */
+    enum { N = 4 };
+    pthread_t t[N];
+    int i;
+    for (i = 0; i < N; i++) {
+        ASSERT_EQ(pthread_create(&t[i], NULL, churn_worker, NULL), 0);
+    }
+    for (i = 0; i < N; i++) {
+        ASSERT_EQ(pthread_join(t[i], NULL), 0);
+    }
+
+    memento_shutdown();
+    ASSERT(memento_init());
+
+    for (i = 0; i < N; i++) {
+        ASSERT_EQ(pthread_create(&t[i], NULL, flush_after_adopt_worker, NULL), 0);
+    }
+    for (i = 0; i < N; i++) {
+        void* rc = (void*)1;
+        ASSERT_EQ(pthread_join(t[i], &rc), 0);
+        ASSERT_EQ(rc, NULL);
+    }
+    ASSERT_NOT_NULL(memento_thread_heap_get());
+}
+
 #endif /* !_WIN32 */
 
 TEST(atfork_registers) {
@@ -277,6 +317,7 @@ int main(void) {
     RUN_TEST(thread_exit_with_outstanding_pointer);
     RUN_TEST(heap_recycling_across_threads);
     RUN_TEST(explicit_park_adopt_cycle);
+    RUN_TEST(shutdown_then_worker_flush);
 #endif
     RUN_TEST(atfork_registers);
     RUN_TEST(guarded_arena_guard_page_faults);

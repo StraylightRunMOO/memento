@@ -1692,6 +1692,20 @@ static void memento_heap_clear_tls(memento_thread_heap_t* heap) {
 
 static void memento_span_purge_stale(memento_thread_heap_t* heap, uint64_t now);
 
+#if MEMENTO_CPU_HEAPS
+static void memento_cpu_heaps_clear(void) {
+    memset(memento_cpu_heaps, 0, sizeof(memento_cpu_heaps));
+}
+
+static void memento_cpu_heaps_drop(memento_thread_heap_t* heap) {
+    unsigned c;
+    if (!heap) return;
+    for (c = 0; c < MEMENTO_CPU_MAX; c++) {
+        if (memento_cpu_heaps[c] == heap) memento_cpu_heaps[c] = NULL;
+    }
+}
+#endif
+
 /* Park `heap` (must be the calling thread's heap, TLS already detached or
  * about to be). Late foreign frees stay safe: they park on the MPSC stack and
  * are drained by the adopting thread or by memento_shutdown. */
@@ -1739,22 +1753,28 @@ memento_thread_heap_t* memento_heap_adopt(void) {
     {
         unsigned cpu = memento_current_cpu();
         memento_thread_heap_t* ch = memento_cpu_heaps[cpu];
-        if (ch && ch->parked) {
+        /* Only adopt through this slot if the heap is still on the parked
+         * list. memento_shutdown frees heaps and used to leave this array
+         * dangling; comparing against the live list avoids that UAF. */
+        if (ch) {
             memento_thread_heap_t** pp = &memento_parked_heaps;
+            int on_list = 0;
             while (*pp) {
-                if (*pp == ch) { *pp = ch->park_next; break; }
+                if (*pp == ch) { *pp = ch->park_next; on_list = 1; break; }
                 pp = &(*pp)->park_next;
             }
-            ch->park_next = NULL;
-            ch->parked = 0;
-            ch->retired = 0;
             memento_cpu_heaps[cpu] = NULL;
-            MEMENTO_REGISTRY_UNLOCK();
-            ch->thread_id = memento_get_thread_id();
-            ch->numa_node = memento_query_numa_node();
-            memento_thread_heap_flush(ch);
-            memento_heap_install_tls(ch);
-            return ch;
+            if (on_list) {
+                ch->park_next = NULL;
+                ch->parked = 0;
+                ch->retired = 0;
+                MEMENTO_REGISTRY_UNLOCK();
+                ch->thread_id = memento_get_thread_id();
+                ch->numa_node = memento_query_numa_node();
+                memento_thread_heap_flush(ch);
+                memento_heap_install_tls(ch);
+                return ch;
+            }
         }
     }
 #endif
@@ -1781,6 +1801,9 @@ memento_thread_heap_t* memento_heap_adopt(void) {
         heap->park_next = NULL;
         heap->parked = 0;
         heap->retired = 0;
+#if MEMENTO_CPU_HEAPS
+        memento_cpu_heaps_drop(heap);
+#endif
     }
     MEMENTO_REGISTRY_UNLOCK();
     if (heap) {
@@ -5528,6 +5551,9 @@ static void memento_atfork_child(void) {
     pthread_mutex_t fresh = PTHREAD_MUTEX_INITIALIZER;
     memento_registry_lock = fresh;
     memento_parked_heaps = NULL;
+#if MEMENTO_CPU_HEAPS
+    memento_cpu_heaps_clear();
+#endif
     memento_thread_heap_t* heap = memento_heap_registry;
     while (heap) {
         heap->retired = 1;
@@ -5617,6 +5643,9 @@ void memento_shutdown(void) {
     memento_thread_heap_t* heap = memento_heap_registry;
     memento_heap_registry = NULL;
     memento_parked_heaps = NULL;
+#if MEMENTO_CPU_HEAPS
+    memento_cpu_heaps_clear();
+#endif
     MEMENTO_REGISTRY_UNLOCK();
 
     while (heap) {
