@@ -6,6 +6,7 @@
 #include "memento.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 
@@ -80,6 +81,100 @@ TEST(bmp_refill_every_class) {
     }
 }
 
+TEST(refill_freelist_pop_clears_bit) {
+    /* Drain/flush sets the occupancy bit and links. refill's single-pop
+     * used to skip bmp_clear, so the next bmp_first re-issued the live
+     * block. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    size_t sz = memento_size_class_to_size(0);
+    void* p;
+    memento_page_t* pg;
+    void* head;
+    int idx;
+    int nwords;
+    bool fresh = false;
+
+    memento_thread_heap_flush(heap);
+    p = memento_thread_heap_alloc(heap, sz);
+    ASSERT(p);
+    memento_thread_heap_free(heap, p, sz);
+    memento_thread_heap_flush(heap);
+
+    pg = heap->active[0];
+    ASSERT(pg != NULL);
+    ASSERT(pg->free != NULL);
+    head = pg->free;
+    idx = memento_page_idx_of(pg, head, sz);
+    ASSERT(idx >= 0 && (unsigned)idx < pg->nbits);
+    ASSERT(memento_bmp_test(pg->bmp, (unsigned)idx));
+
+    p = memento_refill_size_class(heap, 0, &fresh);
+    ASSERT(p == head);
+    ASSERT(!memento_bmp_test(pg->bmp, (unsigned)idx));
+
+    nwords = (int)((pg->nbits + 63u) / 64u);
+    ASSERT(memento_bmp_first(pg->bmp, nwords) != idx);
+
+    memento_thread_heap_free(heap, p, sz);
+}
+
+TEST(no_double_handout_after_page_switch) {
+    /* Fill page 0, spill onto page 1, return some page-0 blocks (bit set
+     * + freelist), then keep allocating. When page 1 is exhausted, refill
+     * pops page 0's freelist; a missed clear re-issues those addresses
+     * on the subsequent bitmap refill. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    size_t sz = memento_size_class_to_size(0);
+    enum { N = 6144 };
+    void** live;
+    int n = 0, i, j, freed = 0;
+    memento_page_t* first_page;
+
+    memento_thread_heap_flush(heap);
+    live = (void**)malloc(sizeof(void*) * (size_t)N);
+    ASSERT(live);
+
+    live[n++] = memento_thread_heap_alloc(heap, sz);
+    ASSERT(live[0]);
+    first_page = memento_page_of(live[0]);
+
+    while (n < N) {
+        live[n] = memento_thread_heap_alloc(heap, sz);
+        ASSERT(live[n]);
+        n++;
+        if (memento_page_of(live[n - 1]) != first_page) break;
+    }
+    for (i = 0; i < 128 && n < N; i++) {
+        live[n] = memento_thread_heap_alloc(heap, sz);
+        ASSERT(live[n]);
+        n++;
+    }
+
+    for (i = 0; i < n && freed < 16; ) {
+        if (memento_page_of(live[i]) == first_page) {
+            memento_thread_heap_free(heap, live[i], sz);
+            live[i] = live[--n];
+            freed++;
+        } else {
+            i++;
+        }
+    }
+    ASSERT(freed > 0);
+    memento_thread_heap_flush(heap);
+
+    while (n < N) {
+        void* p = memento_thread_heap_alloc(heap, sz);
+        ASSERT(p);
+        for (j = 0; j < n; j++) {
+            ASSERT(p != live[j]);
+        }
+        live[n++] = p;
+    }
+
+    for (i = 0; i < n; i++) memento_thread_heap_free(heap, live[i], sz);
+    free(live);
+}
+
 TEST(calloc_recycled_page) {
     /* Force a recycled (non-fresh) calloc of >= 4 KiB. */
     memento_thread_heap_t* heap = memento_thread_heap_get();
@@ -109,6 +204,8 @@ int main(void) {
 #if MEMENTO_PAGE_SIZE
     RUN_TEST(bmp_first_matches_scalar);
     RUN_TEST(bmp_refill_every_class);
+    RUN_TEST(refill_freelist_pop_clears_bit);
+    RUN_TEST(no_double_handout_after_page_switch);
     RUN_TEST(calloc_recycled_page);
 #else
     printf("  (skipped: MEMENTO_PAGE_SIZE=0)\n");

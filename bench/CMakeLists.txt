@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(memento_benchmarks VERSION 3.0.0 LANGUAGES C CXX)
+project(memento_benchmarks VERSION 3.0.2 LANGUAGES C CXX)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)

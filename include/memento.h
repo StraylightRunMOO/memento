@@ -1,5 +1,5 @@
 /*
- * Memento Memory Allocator Library — v3.0.0
+ * Memento Memory Allocator Library — v3.0.2
  *
  * An instrumented multi-strategy allocator for runtimes and dirty libc.
  *
@@ -66,8 +66,8 @@
 /* Version macros for compile-time checking */
 #define MEMENTO_VERSION_MAJOR 3
 #define MEMENTO_VERSION_MINOR 0
-#define MEMENTO_VERSION_PATCH 0
-#define MEMENTO_VERSION_STRING "3.0.0"
+#define MEMENTO_VERSION_PATCH 2
+#define MEMENTO_VERSION_STRING "3.0.2"
 #define MEMENTO_VERSION ((MEMENTO_VERSION_MAJOR << 16) | \
                          (MEMENTO_VERSION_MINOR << 8) | \
                          MEMENTO_VERSION_PATCH)
@@ -2857,6 +2857,23 @@ static memento_page_t* memento_page_acquire(memento_thread_heap_t* heap, size_t 
     heap->active[sc] = memento_span_page_at(span, 1);
     return heap->active[sc];
 }
+
+/* Pop one block from the page freelist and clear its occupancy bit.
+ * Free-to-page paths (drain, flush, free_miss) set the bit and link;
+ * every pop must clear or a later bmp_first will re-issue a live block. */
+MEMENTO_FORCE_INLINE void* memento_page_take_free(memento_page_t* pg, size_t block_size) {
+    void* ptr = pg->free;
+    MEMENTO_ASAN_UNPOISON(ptr, sizeof(void*));
+    pg->free = *(void**)ptr;
+    pg->nused++;
+    {
+        int idx = memento_page_idx_of(pg, ptr, block_size);
+        if (idx >= 0 && (unsigned)idx < pg->nbits) {
+            memento_bmp_clear(pg->bmp, (unsigned)idx);
+        }
+    }
+    return ptr;
+}
 #endif
 
 /* Carve a batch of size-class blocks into the freelist; return one for use.
@@ -2869,10 +2886,7 @@ static void* memento_refill_size_class(memento_thread_heap_t* MEMENTO_RESTRICT h
     memento_page_t* pg = memento_page_acquire(heap, sc, block_size);
     if (MEMENTO_UNLIKELY(!pg)) return NULL;
     if (pg->free) {
-        void* ptr = pg->free;
-        MEMENTO_ASAN_UNPOISON(ptr, sizeof(void*));
-        pg->free = *(void**)ptr;
-        pg->nused++;
+        void* ptr = memento_page_take_free(pg, block_size);
         MEMENTO_ASAN_UNPOISON(ptr, block_size);
         if (out_fresh) *out_fresh = false;
         return ptr;
@@ -2906,10 +2920,8 @@ static void* memento_refill_size_class(memento_thread_heap_t* MEMENTO_RESTRICT h
             pg->free = head;
         }
         {
-            void* ptr = pg->free;
+            void* ptr = memento_page_take_free(pg, block_size);
             MEMENTO_ASAN_UNPOISON(ptr, block_size);
-            pg->free = *(void**)ptr;
-            pg->nused++;
             if (out_fresh) *out_fresh = false;
             return ptr;
         }
@@ -3273,16 +3285,8 @@ MEMENTO_NOINLINE void* memento_fast_alloc_miss(memento_thread_heap_t* MEMENTO_RE
                 uint32_t pk = 0;
                 size_t bs = memento_size_class_to_size(sc);
                 while (pk < 8 && (1u + pk) < memento_tcache_depth() && pg->free) {
-                    void* p = pg->free;
+                    void* p = memento_page_take_free(pg, bs);
                     MEMENTO_ASAN_UNPOISON(p, bs);
-                    pg->free = *(void**)p;
-                    pg->nused++;
-                    {
-                        int idx = memento_page_idx_of(pg, p, bs);
-                        if (idx >= 0 && (unsigned)idx < pg->nbits) {
-                            memento_bmp_clear(pg->bmp, (unsigned)idx);
-                        }
-                    }
                     packed[pk++] = p;
                 }
 #if MEMENTO_SIMD_AVX2

@@ -354,6 +354,58 @@ TEST(foreign_free_owned_batch_and_large) {
 #endif
 }
 
+TEST(foreign_free_no_double_handout) {
+    /* Foreign drain sets the bit and links. Refill pop used to leave the
+     * bit set, so a later bitmap refill handed the live block out twice. */
+    memento_thread_heap_t* owner = memento_thread_heap_get();
+    size_t sz = memento_size_class_to_size(0);
+    enum { N = 4096 };
+    void* live[4096];
+    int n = 0, i, j, gifted = 0;
+    memento_page_t* first_page;
+
+    memento_thread_heap_flush(owner);
+    live[n++] = memento_thread_heap_alloc(owner, sz);
+    ASSERT_NOT_NULL(live[0]);
+    first_page = memento_page_of(live[0]);
+
+    while (n < N) {
+        live[n] = memento_thread_heap_alloc(owner, sz);
+        ASSERT_NOT_NULL(live[n]);
+        n++;
+        if (memento_page_of(live[n - 1]) != first_page) break;
+    }
+    for (i = 0; i < 64 && n < N; i++) {
+        live[n] = memento_thread_heap_alloc(owner, sz);
+        ASSERT_NOT_NULL(live[n]);
+        n++;
+    }
+
+    for (i = 0; i < n && gifted < 8; ) {
+        if (memento_page_of(live[i]) == first_page) {
+            ASSERT_EQ(foreign_free_one(live[i], sz), 0);
+            live[i] = live[--n];
+            gifted++;
+        } else {
+            i++;
+        }
+    }
+    ASSERT(gifted > 0);
+
+    while (n < N) {
+        void* p = memento_thread_heap_alloc(owner, sz);
+        ASSERT_NOT_NULL(p);
+        for (j = 0; j < n; j++) {
+            ASSERT(p != live[j]);
+        }
+        live[n++] = p;
+    }
+
+    for (i = 0; i < n; i++) {
+        memento_thread_heap_free(owner, live[i], sz);
+    }
+}
+
 /* ============================================================================
  * Concurrent Allocator Tests
  * ============================================================================ */
@@ -588,6 +640,7 @@ int main(void) {
     RUN_TEST(foreign_free_flush);
     RUN_TEST(foreign_free_owned_bytes_live);
     RUN_TEST(foreign_free_owned_batch_and_large);
+    RUN_TEST(foreign_free_no_double_handout);
 
     printf("\nConcurrent Allocator Tests:\n");
     RUN_TEST(pool_concurrent);

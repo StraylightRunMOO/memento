@@ -49,14 +49,14 @@ TEST(version_check) {
     /* Check version macros */
     ASSERT_EQ(MEMENTO_VERSION_MAJOR, 3);
     ASSERT_EQ(MEMENTO_VERSION_MINOR, 0);
-    ASSERT_EQ(MEMENTO_VERSION_PATCH, 0);
+    ASSERT_EQ(MEMENTO_VERSION_PATCH, 2);
     
     /* Check version string */
     ASSERT_NOT_NULL(memento_version_string());
-    ASSERT_EQ(strcmp(memento_version_string(), "3.0.0"), 0);
+    ASSERT_EQ(strcmp(memento_version_string(), "3.0.2"), 0);
     
     /* Check version number */
-    ASSERT_EQ(memento_version_number(), 0x030000);
+    ASSERT_EQ(memento_version_number(), 0x030002);
     
     /* Check version check function */
     ASSERT(memento_version_check(2, 0, 0));
