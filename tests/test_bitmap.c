@@ -81,10 +81,9 @@ TEST(bmp_refill_every_class) {
     }
 }
 
-TEST(refill_freelist_pop_clears_bit) {
-    /* Drain/flush sets the occupancy bit and links. refill's single-pop
-     * used to skip bmp_clear, so the next bmp_first re-issued the live
-     * block. */
+TEST(freelist_and_bitmap_are_exclusive) {
+    /* Overflow/flush only links. The bit stays clear, so bmp_first cannot
+     * re-issue a live or freelist block. */
     memento_thread_heap_t* heap = memento_thread_heap_get();
     size_t sz = memento_size_class_to_size(0);
     void* p;
@@ -106,7 +105,7 @@ TEST(refill_freelist_pop_clears_bit) {
     head = pg->free;
     idx = memento_page_idx_of(pg, head, sz);
     ASSERT(idx >= 0 && (unsigned)idx < pg->nbits);
-    ASSERT(memento_bmp_test(pg->bmp, (unsigned)idx));
+    ASSERT(!memento_bmp_test(pg->bmp, (unsigned)idx));
 
     p = memento_refill_size_class(heap, 0, &fresh);
     ASSERT(p);
@@ -227,7 +226,7 @@ int main(void) {
 #if MEMENTO_PAGE_SIZE
     RUN_TEST(bmp_first_matches_scalar);
     RUN_TEST(bmp_refill_every_class);
-    RUN_TEST(refill_freelist_pop_clears_bit);
+    RUN_TEST(freelist_and_bitmap_are_exclusive);
     RUN_TEST(no_double_handout_after_page_switch);
     RUN_TEST(lazy_page_reset_siblings_virgin);
     RUN_TEST(calloc_recycled_page);

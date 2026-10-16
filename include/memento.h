@@ -1102,7 +1102,10 @@ MEMENTO_FORCE_INLINE memento_span_t* memento_span_of(const void* ptr) {
 
 /* 64 KiB page header: lives at the base of each data page (not page 0,
  * which holds the span header). Hit-path nused lives on this line, not
- * 2 MiB away on the span. Foreign frees CAS onto thread_free. */
+ * 2 MiB away on the span. Foreign frees CAS onto thread_free.
+ * Occupancy is exclusive: a set bit means “never handed out / not on
+ * pg->free”. Free-to-page only links; bitmap refill claims never-linked
+ * slots. Overlapping set-and-link was the 3.0.2 double-handout. */
 #define MEMENTO_PAGE_BMP_WORDS 32u /* 2048 bits = 256 B, 32 B class worst case */
 
 typedef struct memento_page {
@@ -1149,16 +1152,11 @@ MEMENTO_FORCE_INLINE unsigned memento_span_reset_limit(const memento_span_t* spa
 }
 
 MEMENTO_FORCE_INLINE void memento_page_push_free(memento_page_t* pg, void* ptr, size_t bs) {
+    (void)bs;
     MEMENTO_ASAN_UNPOISON(ptr, sizeof(void*));
     *(void**)ptr = pg->free;
     pg->free = ptr;
     if (pg->nused) pg->nused--;
-    {
-        int idx = memento_page_idx_of(pg, ptr, bs);
-        if (idx >= 0 && (unsigned)idx < pg->nbits) {
-            memento_bmp_set(pg->bmp, (unsigned)idx);
-        }
-    }
 }
 
 typedef struct {
@@ -2880,20 +2878,15 @@ static memento_page_t* memento_page_acquire(memento_thread_heap_t* heap, size_t 
     return memento_page_claim_virgin(heap, span, sc);
 }
 
-/* Pop one block from the page freelist and clear its occupancy bit.
- * Free-to-page paths (drain, flush, free_miss) set the bit and link;
- * every pop must clear or a later bmp_first will re-issue a live block. */
+/* Pop one block from the page freelist. The bit is already clear: either
+ * it was claimed from the bitmap (cleared on take) or it came back via
+ * push_free (which does not set). */ 
 MEMENTO_FORCE_INLINE void* memento_page_take_free(memento_page_t* pg, size_t block_size) {
     void* ptr = pg->free;
+    (void)block_size;
     MEMENTO_ASAN_UNPOISON(ptr, sizeof(void*));
     pg->free = *(void**)ptr;
     pg->nused++;
-    {
-        int idx = memento_page_idx_of(pg, ptr, block_size);
-        if (idx >= 0 && (unsigned)idx < pg->nbits) {
-            memento_bmp_clear(pg->bmp, (unsigned)idx);
-        }
-    }
     return ptr;
 }
 
