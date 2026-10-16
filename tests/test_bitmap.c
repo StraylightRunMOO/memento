@@ -197,6 +197,39 @@ TEST(lazy_page_reset_siblings_virgin) {
     memento_thread_heap_free(heap, p, sz);
 }
 
+TEST(stash_holds_tcache_overflow) {
+    /* Reverse-free past tcache depth must not write the payload (stash). */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    size_t sz = memento_size_class_to_size(0);
+    enum { N = 200 };
+    void* p[N];
+    int i, j;
+    uint32_t depth;
+
+    memento_thread_heap_flush(heap);
+    for (i = 0; i < N; i++) {
+        p[i] = memento_thread_heap_alloc(heap, sz);
+        ASSERT(p[i]);
+    }
+    for (i = N - 1; i >= 0; i--) {
+        memento_thread_heap_free(heap, p[i], sz);
+    }
+    depth = memento_tcache_depth();
+    ASSERT(heap->tcache[0].top == depth);
+#if MEMENTO_STASH_MAX
+    /* Leftover fill slots can sit in the tcache, so stash is N minus
+     * whatever still fit after that, not exactly N - (depth-1). */
+    ASSERT(heap->stash[0].top > 0);
+    ASSERT(heap->stash[0].top + (depth - 1u) >= (uint32_t)N);
+#endif
+    for (i = 0; i < N; i++) {
+        p[i] = memento_thread_heap_alloc(heap, sz);
+        ASSERT(p[i]);
+        for (j = 0; j < i; j++) ASSERT(p[i] != p[j]);
+    }
+    for (i = 0; i < N; i++) memento_thread_heap_free(heap, p[i], sz);
+}
+
 TEST(calloc_recycled_page) {
     /* Force a recycled (non-fresh) calloc of >= 4 KiB. */
     memento_thread_heap_t* heap = memento_thread_heap_get();
@@ -229,6 +262,7 @@ int main(void) {
     RUN_TEST(freelist_and_bitmap_are_exclusive);
     RUN_TEST(no_double_handout_after_page_switch);
     RUN_TEST(lazy_page_reset_siblings_virgin);
+    RUN_TEST(stash_holds_tcache_overflow);
     RUN_TEST(calloc_recycled_page);
 #else
     printf("  (skipped: MEMENTO_PAGE_SIZE=0)\n");

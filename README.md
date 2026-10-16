@@ -92,9 +92,10 @@ same 64 KiB as the blocks, so the hit path does not dirty a span header
 2 MiB away. A fresh page bump-carves slots (no store into the payload);
 recycled blocks sit on the page freelist. In front of the active page is
 a per-class LIFO tcache (`MEMENTO_TCACHE_DEPTH`, default 32) so churn is
-an indexed load off a hot line. Spans stay single-class. There are 29
-size classes: 16-byte granularity up to 256 B, then steps of at most
-~28% up to 8 KiB.
+an indexed load off a hot line. Tcache overflow lands in a per-class
+pointer stash (no store into the payload) until the next miss or flush.
+Spans stay single-class. There are 29 size classes: 16-byte granularity
+up to 256 B, then steps of at most ~28% up to 8 KiB.
 
 A page's `nused` counts blocks in user hands. When every page in a span is
 empty, the span is parked for reuse. That's the reclamation design.
@@ -293,6 +294,7 @@ not vibes.
 | `MEMENTO_SPAN_SIZE` | 2 MiB | Span size; must be a power of two |
 | `MEMENTO_PAGE_SIZE` | 64 KiB | Pages inside each span; must divide span size |
 | `MEMENTO_TCACHE_DEPTH` | 32 | Per-class LIFO tcache slots (RSS vs churn) |
+| `MEMENTO_STASH_MAX` | 262144 | Per-class overflow stash (0 = free straight to the page) |
 | `MEMENTO_SIMD_AVX2` / `AVX512` / `NEON` | auto | Packed tcache fill + optional bmp_first; compile-time only |
 | `MEMENTO_SIGNAL` | 1 | Shim: 0 = do not install SIGUSR1 |
 | `MEMENTO_VA_RESERVE` | 256 MiB | Process-wide reserved VA for span bump (no overmap) |

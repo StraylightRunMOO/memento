@@ -286,6 +286,33 @@ TEST(heap_span_refill) {
     }
 }
 
+TEST(span_prefetch_parks_extras) {
+    /* Once the heap owns a span, a later span_create maps PREFETCH at
+     * once and parks the extras on span_free. Live 4 KiB blocks keep
+     * their spans busy, so leftover extras are the only occupants of
+     * span_free — without the batch that list is empty. */
+#if MEMENTO_PAGE_SIZE && (MEMENTO_SPAN_PREFETCH > 1u)
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    enum { N = 1200 };
+    void** ptrs;
+    int i;
+    ptrs = (void**)malloc((size_t)N * sizeof(void*));
+    ASSERT_NOT_NULL(ptrs);
+    for (i = 0; i < N; i++) {
+        ptrs[i] = memento_thread_heap_alloc(heap, 4096);
+        ASSERT_NOT_NULL(ptrs[i]);
+    }
+    ASSERT_GE(heap->span_free_count, 1u);
+    for (i = 0; i < N; i++) {
+        memento_thread_heap_free(heap, ptrs[i], 4096);
+    }
+    memento_thread_heap_flush(heap);
+    free(ptrs);
+#else
+    (void)0;
+#endif
+}
+
 TEST(heap_numa_node_query) {
     memento_thread_heap_t* heap = memento_thread_heap_get();
     ASSERT_NOT_NULL(heap);
@@ -1264,6 +1291,7 @@ int main(void) {
     RUN_TEST(heap_large_allocation);
     RUN_TEST(heap_large_cache_reuse);
     RUN_TEST(heap_span_refill);
+    RUN_TEST(span_prefetch_parks_extras);
     RUN_TEST(heap_numa_node_query);
     RUN_TEST(heap_reuse);
     RUN_TEST(heap_realloc);
