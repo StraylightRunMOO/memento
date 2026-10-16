@@ -89,10 +89,12 @@ mappings, so the owning span of any pointer is one `AND` away. Inside each
 span sit 32 × 64 KiB *pages* (`MEMENTO_PAGE_SIZE`). Each page is one size
 class; the page header (including the free list and `nused`) lives in the
 same 64 KiB as the blocks, so the hit path does not dirty a span header
-2 MiB away. In front of the active page is a per-class LIFO tcache
-(`MEMENTO_TCACHE_DEPTH`, default 32) so churn is an indexed load off a hot
-line. Spans stay single-class. There are 29 size classes: 16-byte
-granularity up to 256 B, then steps of at most ~28% up to 8 KiB.
+2 MiB away. A fresh page bump-carves slots (no store into the payload);
+recycled blocks sit on the page freelist. In front of the active page is
+a per-class LIFO tcache (`MEMENTO_TCACHE_DEPTH`, default 32) so churn is
+an indexed load off a hot line. Spans stay single-class. There are 29
+size classes: 16-byte granularity up to 256 B, then steps of at most
+~28% up to 8 KiB.
 
 A page's `nused` counts blocks in user hands. When every page in a span is
 empty, the span is parked for reuse. That's the reclamation design.
@@ -232,21 +234,23 @@ Full write-up, the raw CSV, and how to pull in
 
 | workload | memento 3.0 | 3.0 `STATS=0` | mimalloc 2.1.7 | rpmalloc 1.4.5 | glibc |
 |---|---|---|---|---|---|
-| churn 64 B | 21.7 | 15.2 | 19.8 | **9.1** | 21.5 |
-| churn 1 KiB | 21.9 | 15.3 | 25.3 | **11.9** | 21.9 |
-| bulk 64 B | 67.2 | 59.4 | **27.2** | 38.2 | 85.5 |
-| bulk 4 KiB | 738 | 725 | **583** | 1188 | 1976 |
-| mixed 16–256 B | 139 | 128 | **27.6** | 33.1 | 89.9 |
-| churn 16 KiB | 27.4 | 23.1 | 39.0 | **18.5** | 74.0 |
-| 4-thread churn 64 B | 6.2 | 4.5 | 5.4 | **2.5** | 5.8 |
+| churn 64 B | 21.3 | 14.8 | 19.8 | **9.0** | 21.6 |
+| churn 1 KiB | 21.2 | 14.7 | 25.3 | **12.1** | 21.9 |
+| bulk 64 B | 49.5 | 41.7 | **28.9** | 45.0 | 81.9 |
+| bulk 4 KiB | 690 | 683 | **584** | 1045 | 1958 |
+| mixed 16–256 B | 100 | 93.4 | **28.3** | 33.8 | 91.1 |
+| churn 16 KiB | 27.3 | 22.0 | 39.0 | **18.4** | 74.2 |
+| 4-thread churn 64 B | 6.0 | 3.6 | 5.6 | **2.5** | 5.9 |
 
 How to read this without lying to yourself:
 
 - **Against the field:** rpmalloc still owns the hit path (churn, 16 KiB,
-  threads). `STATS=0` memento beats mimalloc and glibc on those three and
-  sits in the same band as glibc on bulk. **Mixed sizes is the remaining
-  gap** — 4–5× the leading pair on this box. That row is span occupancy /
-  page-claim, not the tcache. If nanoseconds are all you want, take
+  threads). `STATS=0` memento beats mimalloc and glibc on those three.
+  **bulk-64 B** now beats rpmalloc and glibc and sits behind mimalloc's
+  unbounded page freelist (41.7 vs 28.9). **Mixed sizes is the remaining
+  gap** — about 3× the leading pair on this box (93 vs 28), down from
+  4–5×. That row is a cold burst across 11 classes: lazy page reset
+  plus bump-carve, not the tcache. If nanoseconds are all you want, take
   rpmalloc. What it won't give you is the rest of this README: heap
   reports, allocation-site attribution, guard-page arenas, proxy layers,
   and a shim that catches your leaks in a running process.
@@ -258,10 +262,10 @@ How to read this without lying to yourself:
   lets v3 notice a span is empty and hand its pages back at all. 2.2.1
   was faster here partly because it *never returned memory to the OS*.
   You can have that row or you can have RSS that comes back; we chose RSS.
-  `-DMEMENTO_STATS=0` is the other lever (21.6 → 14.7 ns here).
+  `-DMEMENTO_STATS=0` is the other lever (21.3 → 14.8 ns here).
 - **bulk-4 KiB is mostly first-touch.** Once spans sit on 2 MiB-aligned
   VA (so THP can actually collapse), memento lands next to mimalloc
-  (738 vs 583 ns) and ahead of rpmalloc and glibc. Before that fix this
+  (690 vs 584 ns) and ahead of rpmalloc and glibc. Before that fix this
   row was a 4K-fault costume at ~1.9 µs.
 
 Run it yourself:
@@ -289,7 +293,7 @@ not vibes.
 | `MEMENTO_SPAN_SIZE` | 2 MiB | Span size; must be a power of two |
 | `MEMENTO_PAGE_SIZE` | 64 KiB | Pages inside each span; must divide span size |
 | `MEMENTO_TCACHE_DEPTH` | 32 | Per-class LIFO tcache slots (RSS vs churn) |
-| `MEMENTO_SIMD_AVX2` / `AVX512` / `NEON` | auto | Miss-path bitmap scan + packed tcache fill; compile-time only |
+| `MEMENTO_SIMD_AVX2` / `AVX512` / `NEON` | auto | Packed tcache fill + optional bmp_first; compile-time only |
 | `MEMENTO_SIGNAL` | 1 | Shim: 0 = do not install SIGUSR1 |
 | `MEMENTO_VA_RESERVE` | 256 MiB | Process-wide reserved VA for span bump (no overmap) |
 | `MEMENTO_GLOBAL_PAGE_CACHE` | 64 | Process-wide empty-span cache |

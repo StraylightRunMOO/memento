@@ -218,7 +218,7 @@ extern "C" {
     #define MEMENTO_GLOBAL_PAGE_CACHE 64
 #endif
 
-/* Compile-time ISA for miss-path SIMD. Never cpuid on the hit path. */
+/* Compile-time ISA for packed tcache fill. Never cpuid on the hit path. */
 #ifndef MEMENTO_SIMD_AVX512
     #if defined(__AVX512F__) && defined(__AVX512BW__)
         #define MEMENTO_SIMD_AVX512 1
@@ -243,7 +243,8 @@ extern "C" {
     #endif
 #endif
 
-/* How many blocks to carve into the freelist on a size-class cache miss */
+/* How many blocks to carve on a size-class cache miss (bump-span path).
+ * Page mode fills the tcache to memento_tcache_depth() instead. */
 #ifndef MEMENTO_REFILL_BATCH
     #define MEMENTO_REFILL_BATCH 32
 #endif
@@ -2922,9 +2923,10 @@ static uint32_t memento_tcache_fill_from_page(memento_tcache_bin_t* bin,
 }
 #endif
 
-/* Carve a batch of size-class blocks into the freelist; return one for use.
- * *out_fresh (when given) reports whether the returned block is guaranteed
- * kernel-zero — calloc uses it to skip memset. */
+/* Refill the class tcache from the active page (recycled freelist, then
+ * virgin bump) or, without pages, bump-carve a span. *out_fresh reports
+ * whether the returned block is guaranteed kernel-zero — calloc uses it
+ * to skip memset. */
 static void* memento_refill_size_class(memento_thread_heap_t* MEMENTO_RESTRICT heap,
                                         size_t sc, bool* out_fresh) {
     size_t block_size = memento_size_class_to_size(sc);

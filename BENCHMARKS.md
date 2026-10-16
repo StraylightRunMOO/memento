@@ -35,28 +35,30 @@ Absolute nanoseconds are a function of this 1.7 GHz core. Read the
 
 | workload | memento 3.0 | 3.0 `STATS=0` | mimalloc 2.1.7 | rpmalloc 1.4.5 | glibc |
 |---|---:|---:|---:|---:|---:|
-| churn 64 B | 21.7 | 15.2 | 19.8 | **9.1** | 21.5 |
-| churn 1 KiB | 21.9 | 15.3 | 25.3 | **11.9** | 21.9 |
-| bulk 64 B | 67.2 | 59.4 | **27.2** | 38.2 | 85.5 |
-| bulk 4 KiB | 738 | 725 | **583** | 1188 | 1976 |
-| mixed 16–256 B | 139 | 128 | **27.6** | 33.1 | 89.9 |
-| churn 16 KiB | 27.4 | 23.1 | 39.0 | **18.5** | 74.0 |
-| 4-thread churn 64 B | 6.2 | 4.5 | 5.4 | **2.5** | 5.8 |
+| churn 64 B | 21.3 | 14.8 | 19.8 | **9.0** | 21.6 |
+| churn 1 KiB | 21.2 | 14.7 | 25.3 | **12.1** | 21.9 |
+| bulk 64 B | 49.5 | 41.7 | **28.9** | 45.0 | 81.9 |
+| bulk 4 KiB | 690 | 683 | **584** | 1045 | 1958 |
+| mixed 16–256 B | 100 | 93.4 | **28.3** | 33.8 | 91.1 |
+| churn 16 KiB | 27.3 | 22.0 | 39.0 | **18.4** | 74.2 |
+| 4-thread churn 64 B | 6.0 | 3.6 | 5.6 | **2.5** | 5.9 |
 
 How to read it:
 
 - **Hit-path churn.** `STATS=0` is the fair product comparison (the
   default build still carries the counters the diagnostic story wants).
-  rpmalloc remains ahead (~9 vs ~15 ns). mimalloc and glibc sit with the
-  stats-on build on this core.
-- **Mixed sizes** is still the gap: memento is 4–5× the leading pair.
-  That row is span occupancy / page-claim, not the tcache hit. Phase 2
-  SIMD is compiled in (`-march=native` enables NEON on this chip) and
-  was not enough to close it here.
+  rpmalloc remains ahead (~9 vs ~15 ns). `STATS=0` beats mimalloc and
+  glibc on this core.
+- **Mixed sizes** is still the gap: about 3× mimalloc (93 vs 28), down
+  from 4–5×. A fresh page bump-carves without writing the payload;
+  recycled blocks travel the page freelist; pages are reset only when
+  claimed. The STATS=1 mixed row claims ~118 pages (the live payload)
+  rather than 31 per span. The leftover is a cold 11-class burst.
 - **Bulk 64 B / 4 KiB.** 2 MiB-aligned VA lets THP actually collapse:
-  bulk-4 KiB dropped from ~1.9 µs to 738 ns, next to mimalloc (583) and
-  ahead of rpmalloc. bulk-64 B still trails mimalloc/rpmalloc (those two
-  keep a hotter unbounded freelist; we recycle at span grain).
+  bulk-4 KiB sits next to mimalloc (690 vs 584 ns) and ahead of
+  rpmalloc. bulk-64 B (`STATS=0` 41.7) now beats rpmalloc (45) and
+  trails mimalloc (29) — those keep a hotter unbounded freelist; we
+  recycle at span grain with a bounded tcache (depth 32).
 - **16 KiB churn** is the page-run cache: memento beats mimalloc and
   glibc, trails rpmalloc.
 - **Four threads.** Same shape as single-thread churn, scaled. No
