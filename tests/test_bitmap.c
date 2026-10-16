@@ -109,8 +109,11 @@ TEST(refill_freelist_pop_clears_bit) {
     ASSERT(memento_bmp_test(pg->bmp, (unsigned)idx));
 
     p = memento_refill_size_class(heap, 0, &fresh);
-    ASSERT(p == head);
+    ASSERT(p);
+    idx = memento_page_idx_of(pg, p, sz);
+    ASSERT(idx >= 0 && (unsigned)idx < pg->nbits);
     ASSERT(!memento_bmp_test(pg->bmp, (unsigned)idx));
+    (void)head;
 
     nwords = (int)((pg->nbits + 63u) / 64u);
     ASSERT(memento_bmp_first(pg->bmp, nwords) != idx);
@@ -175,6 +178,26 @@ TEST(no_double_handout_after_page_switch) {
     free(live);
 }
 
+TEST(lazy_page_reset_siblings_virgin) {
+    /* A class that earlier tests barely filled still has unreset pages. */
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    size_t sc = MEMENTO_SIZE_CLASS_COUNT - 1;
+    size_t sz = memento_size_class_to_size(sc);
+    void* p;
+    memento_span_t* span;
+    memento_page_t* next;
+
+    p = memento_thread_heap_alloc(heap, sz);
+    ASSERT(p);
+    span = memento_span_of(p);
+    ASSERT(span->carved >= 1);
+    ASSERT(span->carved + 1 < MEMENTO_PAGES_PER_SPAN);
+    next = memento_span_page_at(span, span->carved + 1);
+    ASSERT(next->nbits == 0);
+    ASSERT(next->nused == 0);
+    memento_thread_heap_free(heap, p, sz);
+}
+
 TEST(calloc_recycled_page) {
     /* Force a recycled (non-fresh) calloc of >= 4 KiB. */
     memento_thread_heap_t* heap = memento_thread_heap_get();
@@ -206,6 +229,7 @@ int main(void) {
     RUN_TEST(bmp_refill_every_class);
     RUN_TEST(refill_freelist_pop_clears_bit);
     RUN_TEST(no_double_handout_after_page_switch);
+    RUN_TEST(lazy_page_reset_siblings_virgin);
     RUN_TEST(calloc_recycled_page);
 #else
     printf("  (skipped: MEMENTO_PAGE_SIZE=0)\n");

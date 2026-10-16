@@ -197,7 +197,7 @@ extern "C" {
     #define MEMENTO_TCACHE_DEPTH_MAX 64
 #endif
 #ifndef MEMENTO_TCACHE_DEPTH
-    #define MEMENTO_TCACHE_DEPTH 16
+    #define MEMENTO_TCACHE_DEPTH 32
 #endif
 #if MEMENTO_TCACHE_DEPTH > MEMENTO_TCACHE_DEPTH_MAX
     #undef MEMENTO_TCACHE_DEPTH
@@ -1069,7 +1069,8 @@ typedef struct memento_span_s {
     struct memento_thread_heap_s* owner;
     size_t used;
     size_t capacity;
-    uint32_t carved;     /* blocks carved since (re)assignment (debug/stats) */
+    uint32_t carved;     /* page mode: data pages reset this assignment (0..31);
+                          * bump mode: blocks carved since (re)assignment */
     int32_t live;        /* blocks currently in user hands — the reclaim trigger */
     int32_t sc;          /* owning size class; -1 while unassigned */
     uint8_t reclaimed;   /* 0 active, 1 free-listed (pages kept), 2 free-listed (MADV_DONTNEED'd) */
@@ -1139,6 +1140,25 @@ MEMENTO_FORCE_INLINE int memento_bmp_test(const uint64_t* b, unsigned bit) {
 MEMENTO_FORCE_INLINE int memento_page_idx_of(memento_page_t* pg, void* ptr, size_t bs) {
     size_t off = (size_t)((char*)ptr - (char*)pg) - memento_page_payload_off();
     return (int)(off / bs);
+}
+
+MEMENTO_FORCE_INLINE unsigned memento_span_reset_limit(const memento_span_t* span) {
+    unsigned c = span->carved;
+    if (c >= MEMENTO_PAGES_PER_SPAN) c = MEMENTO_PAGES_PER_SPAN - 1u;
+    return c;
+}
+
+MEMENTO_FORCE_INLINE void memento_page_push_free(memento_page_t* pg, void* ptr, size_t bs) {
+    MEMENTO_ASAN_UNPOISON(ptr, sizeof(void*));
+    *(void**)ptr = pg->free;
+    pg->free = ptr;
+    if (pg->nused) pg->nused--;
+    {
+        int idx = memento_page_idx_of(pg, ptr, bs);
+        if (idx >= 0 && (unsigned)idx < pg->nbits) {
+            memento_bmp_set(pg->bmp, (unsigned)idx);
+        }
+    }
 }
 
 typedef struct {
@@ -1971,24 +1991,15 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
         while (bin->top > 1) {
             void* p = bin->slot[--bin->top];
             memento_page_t* home = memento_page_of(p);
-            MEMENTO_ASAN_UNPOISON(p, sizeof(void*));
-            *(void**)p = home->free;
-            home->free = p;
-            if (home->nused) home->nused--;
-            {
-                size_t bs = memento_size_class_to_size(home->sc);
-                int idx = memento_page_idx_of(home, p, bs);
-                if (idx >= 0 && (unsigned)idx < home->nbits) {
-                    memento_bmp_set(home->bmp, (unsigned)idx);
-                }
-            }
+            size_t bs = memento_size_class_to_size(home->sc);
+            memento_page_push_free(home, p, bs);
         }
         memento_page_drain(heap->active[i]);
     }
     for (memento_span_t* span = heap->span_list; span; span = span->next) {
         if (span->reclaimed) continue;
-        unsigned pi;
-        for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
+        unsigned pi, lim = memento_span_reset_limit(span);
+        for (pi = 1; pi <= lim; pi++) {
             memento_page_drain(memento_span_page_at(span, pi));
         }
         if (span->sc >= 0 && (size_t)span->sc < MEMENTO_SIZE_CLASS_COUNT &&
@@ -1996,7 +2007,7 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
             continue;
         }
         int busy = 0;
-        for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
+        for (pi = 1; pi <= lim; pi++) {
             if (memento_span_page_at(span, pi)->nused) { busy = 1; break; }
         }
         if (!busy && span->sc >= 0) {
@@ -2795,15 +2806,7 @@ static void memento_page_drain(memento_page_t* pg) {
     while (n) {
         memento_foreign_node_t* next = n->next;
         memento_debug_on_foreign_drain(n);
-        *(void**)n = pg->free;
-        pg->free = n;
-        if (pg->nused) pg->nused--;
-        {
-            int idx = memento_page_idx_of(pg, n, bs);
-            if (idx >= 0 && (unsigned)idx < pg->nbits) {
-                memento_bmp_set(pg->bmp, (unsigned)idx);
-            }
-        }
+        memento_page_push_free(pg, n, bs);
         n = next;
 #if MEMENTO_STATS
         if (owner) {
@@ -2818,13 +2821,32 @@ static memento_page_t* memento_span_page_at(memento_span_t* span, unsigned i) {
     return (memento_page_t*)((char*)span + (size_t)i * MEMENTO_PAGE_SIZE);
 }
 
+MEMENTO_FORCE_INLINE int memento_page_has_free(const memento_page_t* pg) {
+    if (pg->free) return 1;
+    if (!pg->nbits) return 0;
+    return memento_bmp_first(pg->bmp, (int)((pg->nbits + 63u) / 64u)) >= 0;
+}
+
+static memento_page_t* memento_page_claim_virgin(memento_thread_heap_t* heap,
+                                                 memento_span_t* span, size_t sc) {
+    if (span->carved + 1u >= MEMENTO_PAGES_PER_SPAN) return NULL;
+    unsigned i = ++span->carved;
+    memento_page_t* pg = memento_span_page_at(span, i);
+    memento_page_reset(pg, (uint8_t)sc);
+    heap->active[sc] = pg;
+#if MEMENTO_STATS
+    heap->stats.page_claims++;
+#endif
+    return pg;
+}
+
 static memento_page_t* memento_page_acquire(memento_thread_heap_t* heap, size_t sc,
                                             size_t block_size) {
     (void)block_size;
     memento_page_t* pg = heap->active[sc];
     if (pg) {
         memento_page_drain(pg);
-        if (pg->free || memento_bmp_first(pg->bmp, (int)((pg->nbits + 63u) / 64u)) >= 0) {
+        if (memento_page_has_free(pg)) {
             return pg;
         }
     }
@@ -2832,30 +2854,30 @@ static memento_page_t* memento_page_acquire(memento_thread_heap_t* heap, size_t 
     if (!span) {
         span = memento_span_for_class(heap, sc);
         if (!span) return NULL;
-        for (unsigned i = 1; i < MEMENTO_PAGES_PER_SPAN; i++) {
-            memento_page_reset(memento_span_page_at(span, i), (uint8_t)sc);
-        }
+        /* Do not reset pages 1..N here: that first-touches 2 MiB per class.
+         * carved is 0; the first claim below resets page 1 only. */
     }
-    for (unsigned i = 1; i < MEMENTO_PAGES_PER_SPAN; i++) {
-        memento_page_t* cand = memento_span_page_at(span, i);
-        memento_page_drain(cand);
-        if (cand->free || memento_bmp_first(cand->bmp, (int)((cand->nbits + 63u) / 64u)) >= 0) {
-            heap->active[sc] = cand;
+    {
+        unsigned i, lim = memento_span_reset_limit(span);
+        for (i = 1; i <= lim; i++) {
+            memento_page_t* cand = memento_span_page_at(span, i);
+            memento_page_drain(cand);
+            if (memento_page_has_free(cand)) {
+                heap->active[sc] = cand;
 #if MEMENTO_STATS
-            heap->stats.page_claims++;
+                heap->stats.page_claims++;
 #endif
-            return cand;
+                return cand;
+            }
         }
     }
+    pg = memento_page_claim_virgin(heap, span, sc);
+    if (pg) return pg;
     /* Span is fully carved. Park it and take a new one. */
     heap->span_partial[sc] = NULL;
     span = memento_span_for_class(heap, sc);
     if (!span) return NULL;
-    for (unsigned i = 1; i < MEMENTO_PAGES_PER_SPAN; i++) {
-        memento_page_reset(memento_span_page_at(span, i), (uint8_t)sc);
-    }
-    heap->active[sc] = memento_span_page_at(span, 1);
-    return heap->active[sc];
+    return memento_page_claim_virgin(heap, span, sc);
 }
 
 /* Pop one block from the page freelist and clear its occupancy bit.
@@ -2874,6 +2896,46 @@ MEMENTO_FORCE_INLINE void* memento_page_take_free(memento_page_t* pg, size_t blo
     }
     return ptr;
 }
+
+/* Pack pg->free into the tcache. Returns how many slots were stored at
+ * slot[1..]. Caller pops one when top > 1. */
+static uint32_t memento_tcache_fill_from_page(memento_tcache_bin_t* bin,
+                                              memento_page_t* pg, size_t bs) {
+    uint32_t depth = memento_tcache_depth();
+    uint32_t pk = 0;
+    void* packed[MEMENTO_TCACHE_DEPTH_MAX];
+    while ((1u + pk) < depth && pg->free && pk < MEMENTO_TCACHE_DEPTH_MAX) {
+        packed[pk++] = memento_page_take_free(pg, bs);
+    }
+    if (!pk) return 0;
+#if MEMENTO_SIMD_AVX2
+    if (pk == 8) {
+        _mm256_storeu_si256((__m256i*)&bin->slot[1],
+            _mm256_loadu_si256((const __m256i*)&packed[0]));
+        _mm256_storeu_si256((__m256i*)&bin->slot[5],
+            _mm256_loadu_si256((const __m256i*)&packed[4]));
+    } else
+#elif MEMENTO_SIMD_AVX512
+    if (pk == 8) {
+        _mm512_storeu_si512(&bin->slot[1], _mm512_loadu_si512(&packed[0]));
+    } else
+#elif MEMENTO_SIMD_NEON
+    if (pk >= 4) {
+        uint32_t s = 0;
+        for (; s + 2 <= pk; s += 2) {
+            vst1q_u64((uint64_t*)&bin->slot[1 + s],
+                      vld1q_u64((const uint64_t*)&packed[s]));
+        }
+        for (; s < pk; s++) bin->slot[1 + s] = packed[s];
+    } else
+#endif
+    {
+        uint32_t s;
+        for (s = 0; s < pk; s++) bin->slot[1 + s] = packed[s];
+    }
+    bin->top = 1u + pk;
+    return pk;
+}
 #endif
 
 /* Carve a batch of size-class blocks into the freelist; return one for use.
@@ -2885,14 +2947,8 @@ static void* memento_refill_size_class(memento_thread_heap_t* MEMENTO_RESTRICT h
 #if MEMENTO_PAGE_SIZE
     memento_page_t* pg = memento_page_acquire(heap, sc, block_size);
     if (MEMENTO_UNLIKELY(!pg)) return NULL;
-    if (pg->free) {
-        void* ptr = memento_page_take_free(pg, block_size);
-        MEMENTO_ASAN_UNPOISON(ptr, block_size);
-        if (out_fresh) *out_fresh = false;
-        return ptr;
-    }
-    /* Bitmap refill: claim K free bits, link backwards, return one. */
-    {
+    if (!pg->free) {
+        /* Bitmap refill: claim K free bits, link onto pg->free. */
         int nwords = (int)((pg->nbits + 63u) / 64u);
         uint32_t batch = MEMENTO_REFILL_BATCH;
         void* blocks[32];
@@ -2905,7 +2961,6 @@ static void* memento_refill_size_class(memento_thread_heap_t* MEMENTO_RESTRICT h
             blocks[k++] = memento_page_slot(pg, (unsigned)bit, block_size);
         }
         if (!k) return NULL;
-        /* Walk the page backwards: scalar next-stores beat scatter. */
         {
             uint32_t i;
             void* head = pg->free;
@@ -2919,13 +2974,24 @@ static void* memento_refill_size_class(memento_thread_heap_t* MEMENTO_RESTRICT h
             }
             pg->free = head;
         }
-        {
-            void* ptr = memento_page_take_free(pg, block_size);
+    }
+    {
+        memento_tcache_bin_t* bin = &heap->tcache[sc];
+        memento_tcache_fill_from_page(bin, pg, block_size);
+        if (MEMENTO_LIKELY(bin->top > 1)) {
+            void* ptr = bin->slot[--bin->top];
             MEMENTO_ASAN_UNPOISON(ptr, block_size);
             if (out_fresh) *out_fresh = false;
             return ptr;
         }
     }
+    if (pg->free) {
+        void* ptr = memento_page_take_free(pg, block_size);
+        MEMENTO_ASAN_UNPOISON(ptr, block_size);
+        if (out_fresh) *out_fresh = false;
+        return ptr;
+    }
+    return NULL;
 #else
     memento_size_class_cache_t* MEMENTO_RESTRICT cache = &heap->caches[sc];
 
@@ -3251,9 +3317,9 @@ MEMENTO_NOINLINE void* memento_fast_alloc_miss(memento_thread_heap_t* MEMENTO_RE
     if (MEMENTO_UNLIKELY(heap == NULL)) {
         return NULL;
     }
-    {
+    if (MEMENTO_UNLIKELY(heap->span_free != NULL)) {
         static MEMENTO_TLS uint32_t decay;
-        if ((++decay & 63u) == 0) {
+        if ((++decay & 255u) == 0) {
             memento_span_purge_stale(heap, memento_now_ms());
         }
     }
@@ -3278,49 +3344,10 @@ MEMENTO_NOINLINE void* memento_fast_alloc_miss(memento_thread_heap_t* MEMENTO_RE
 #if MEMENTO_STATS
             heap->stats.page_hits++;
 #endif
-            /* Miss: pack up to 8 from the page into the tcache, then pop. */
-            uint32_t n = 1;
             {
-                void* packed[8];
-                uint32_t pk = 0;
                 size_t bs = memento_size_class_to_size(sc);
-                while (pk < 8 && (1u + pk) < memento_tcache_depth() && pg->free) {
-                    void* p = memento_page_take_free(pg, bs);
-                    MEMENTO_ASAN_UNPOISON(p, bs);
-                    packed[pk++] = p;
-                }
-#if MEMENTO_SIMD_AVX2
-                if (pk == 8) {
-                    _mm256_storeu_si256((__m256i*)&bin->slot[1],
-                        _mm256_loadu_si256((const __m256i*)&packed[0]));
-                    _mm256_storeu_si256((__m256i*)&bin->slot[5],
-                        _mm256_loadu_si256((const __m256i*)&packed[4]));
-                    n = 9;
-                } else
-#elif MEMENTO_SIMD_AVX512
-                if (pk == 8) {
-                    _mm512_storeu_si512(&bin->slot[1],
-                        _mm512_loadu_si512(&packed[0]));
-                    n = 9;
-                } else
-#elif MEMENTO_SIMD_NEON
-                if (pk >= 4) {
-                    uint32_t s = 0;
-                    for (; s + 2 <= pk; s += 2) {
-                        vst1q_u64((uint64_t*)&bin->slot[1 + s],
-                                  vld1q_u64((const uint64_t*)&packed[s]));
-                    }
-                    for (; s < pk; s++) bin->slot[1 + s] = packed[s];
-                    n = 1 + pk;
-                } else
-#endif
-                {
-                    uint32_t s;
-                    for (s = 0; s < pk; s++) bin->slot[1 + s] = packed[s];
-                    n = 1 + pk;
-                }
+                memento_tcache_fill_from_page(bin, pg, bs);
             }
-            bin->top = n;
             if (MEMENTO_LIKELY(bin->top > 1)) {
                 void* ptr = bin->slot[--bin->top];
                 size_t block_size = memento_size_class_to_size(sc);
@@ -3363,25 +3390,9 @@ MEMENTO_NOINLINE void memento_free_size_class_miss(memento_thread_heap_t* MEMENT
     size_t sc = memento_size_class_for(size);
     size_t block_size = memento_size_class_to_size(sc);
 #if MEMENTO_PAGE_SIZE
-    memento_tcache_bin_t* bin = &heap->tcache[sc];
     {
-        uint32_t i;
-        for (i = 0; i < 8 && bin->top > 1; i++) {
-            void* p = bin->slot[--bin->top];
-            memento_page_t* home = memento_page_of(p);
-            MEMENTO_ASAN_UNPOISON(p, sizeof(void*));
-            *(void**)p = home->free;
-            home->free = p;
-            if (home->nused) home->nused--;
-            {
-                size_t bs = memento_size_class_to_size(home->sc);
-                int idx = memento_page_idx_of(home, p, bs);
-                if (idx >= 0 && (unsigned)idx < home->nbits) {
-                    memento_bmp_set(home->bmp, (unsigned)idx);
-                }
-            }
-        }
-        bin->slot[bin->top++] = ptr;
+        memento_page_t* home = memento_page_of(ptr);
+        memento_page_push_free(home, ptr, block_size);
     }
     MEMENTO_ASAN_POISON(ptr, block_size);
     MEMENTO_STAT_FREE(heap, sc, block_size);
@@ -3391,10 +3402,9 @@ MEMENTO_NOINLINE void memento_free_size_class_miss(memento_thread_heap_t* MEMENT
                          && heap->tcache[pg->sc].top <= 1)) {
         memento_span_t* span = memento_span_of(ptr);
         int busy = 0;
-        unsigned i;
-        for (i = 1; i < MEMENTO_PAGES_PER_SPAN; i++) {
-            memento_page_t* pgi = (memento_page_t*)((char*)span +
-                (size_t)i * MEMENTO_PAGE_SIZE);
+        unsigned i, lim = memento_span_reset_limit(span);
+        for (i = 1; i <= lim; i++) {
+            memento_page_t* pgi = memento_span_page_at(span, i);
             if (pgi->nused) { busy = 1; break; }
         }
         if (!busy && span->sc >= 0 &&
@@ -5391,7 +5401,8 @@ static void memento_span_free_unlink(memento_thread_heap_t* heap, memento_span_t
 static int memento_span_has_live(memento_span_t* span) {
 #if MEMENTO_PAGE_SIZE
     unsigned pi;
-    for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
+    unsigned lim = memento_span_reset_limit(span);
+    for (pi = 1; pi <= lim; pi++) {
         memento_page_t* pg = memento_span_page_at(span, pi);
         memento_page_drain(pg);
         if (pg->nused) return 1;

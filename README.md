@@ -90,7 +90,7 @@ span sit 32 × 64 KiB *pages* (`MEMENTO_PAGE_SIZE`). Each page is one size
 class; the page header (including the free list and `nused`) lives in the
 same 64 KiB as the blocks, so the hit path does not dirty a span header
 2 MiB away. In front of the active page is a per-class LIFO tcache
-(`MEMENTO_TCACHE_DEPTH`, default 16) so churn is an indexed load off a hot
+(`MEMENTO_TCACHE_DEPTH`, default 32) so churn is an indexed load off a hot
 line. Spans stay single-class. There are 29 size classes: 16-byte
 granularity up to 256 B, then steps of at most ~28% up to 8 KiB.
 
@@ -288,7 +288,7 @@ not vibes.
 | `MEMENTO_DEBUG` | 0 | Fill patterns, canaries, owner-thread checks, double-free detection |
 | `MEMENTO_SPAN_SIZE` | 2 MiB | Span size; must be a power of two |
 | `MEMENTO_PAGE_SIZE` | 64 KiB | Pages inside each span; must divide span size |
-| `MEMENTO_TCACHE_DEPTH` | 16 | Per-class LIFO tcache slots (RSS vs churn) |
+| `MEMENTO_TCACHE_DEPTH` | 32 | Per-class LIFO tcache slots (RSS vs churn) |
 | `MEMENTO_SIMD_AVX2` / `AVX512` / `NEON` | auto | Miss-path bitmap scan + packed tcache fill; compile-time only |
 | `MEMENTO_SIGNAL` | 1 | Shim: 0 = do not install SIGUSR1 |
 | `MEMENTO_VA_RESERVE` | 256 MiB | Process-wide reserved VA for span bump (no overmap) |
