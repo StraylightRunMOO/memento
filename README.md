@@ -65,11 +65,17 @@ the block in the wrong size class. Memento won't crash (release builds
 never abort on a bad free), but the heap will quietly drift. This is the
 same contract rpmalloc's sized-free API has; we just say it out loud.
 
+When another thread holds the pointer and the allocating heap is not in
+hand, `memento_thread_heap_free_owned(ptr, size)` looks up the owner from
+the span (small blocks) or the large-block header (page-run / huge) and
+routes the free home. `memento_thread_heap_of(ptr, size)` returns that heap.
+
 Which should you use? If you're wrapping memento in a data structure or a
 language runtime where sizes are statically known — exact. If you're doing
 general-purpose "replace malloc" work — sized. Pick a mode and stay in it:
 `memento_free` is sized-only. Exact pointers go through
-`memento_thread_heap_free(heap, ptr, size)`. Passing an exact pointer to
+`memento_thread_heap_free(heap, ptr, size)` or
+`memento_thread_heap_free_owned(ptr, size)`. Passing an exact pointer to
 `memento_free` is not mixed-mode cleverness — it is a no-op in release
 (the block leaks) and a debug failure.
 

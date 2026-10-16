@@ -22,8 +22,11 @@
  *
  * Threading contract:
  * - memento_thread_heap_alloc / realloc / flush: owning thread only
- * - memento_thread_heap_free: ANY thread (exact size required in
- *   MEMENTO_EXACT_SIZE mode; ignored in MEMENTO_SIZED mode)
+ * - memento_thread_heap_free: ANY thread, but you must pass the allocating
+ *   heap (exact size required in MEMENTO_EXACT_SIZE mode; ignored in
+ *   MEMENTO_SIZED mode)
+ * - memento_thread_heap_free_owned: ANY thread; looks up the allocating heap
+ *   from the span (small) or large-block header (page-run / huge)
  * - When a thread exits, its heap is flushed and parked (see
  *   memento_heap_park / memento_heap_adopt); the next thread on this worker
  *   adopts it instead of paying for fresh mmaps.
@@ -501,7 +504,11 @@ memento_thread_heap_t* memento_thread_heap_get(void);
  * memento_thread_heap_free may be called from ANY thread: foreign frees are
  * pushed onto the heap's lock-free MPSC stack and reclaimed by the owner.
  * EXACT_SIZE mode: the exact allocation size must be passed to free.
- * SIZED mode: size is ignored at free; the header is authoritative. */
+ * SIZED mode: size is ignored at free; the header is authoritative.
+ *
+ * When the allocating heap is not in hand, memento_thread_heap_free_owned
+ * (and memento_thread_heap_of) resolve ownership from the pointer: span
+ * header for small blocks, large-block meta for page-run / huge. */
 #if MEMENTO_SIZED
 MEMENTO_ATTR_MALLOC MEMENTO_ATTR_ALLOC_SIZE(2) MEMENTO_ATTR_FLATTEN
 void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size);
@@ -1317,6 +1324,41 @@ MEMENTO_FORCE_INLINE void memento_free_exact(memento_thread_heap_t* heap,
     memento_heap_free_local(heap, ptr, size);
 }
 
+/* Heap that allocated this pointer. `size` is the exact-mode allocation size
+ * (same contract as memento_thread_heap_free). Small: span header. Large:
+ * 32-byte meta immediately before the user pointer; sized large also tries
+ * 16 bytes further back. */
+MEMENTO_FORCE_INLINE memento_thread_heap_t*
+memento_thread_heap_of(const void* ptr, size_t size) {
+    if (MEMENTO_UNLIKELY(ptr == NULL)) return NULL;
+    if (size <= MEMENTO_MAX_SIZE_CLASS) {
+        return memento_span_of(ptr)->owner;
+    }
+    const memento_large_meta_t* meta =
+        (const memento_large_meta_t*)((const char*)ptr - MEMENTO_LARGE_META_SIZE);
+    if (meta->magic == MEMENTO_LARGE_MAGIC && meta->pages != 0) {
+        return meta->owner;
+    }
+    meta = (const memento_large_meta_t*)((const char*)ptr - 16u - MEMENTO_LARGE_META_SIZE);
+    if (meta->magic == MEMENTO_LARGE_MAGIC && meta->pages != 0) {
+        return meta->owner;
+    }
+    return NULL;
+}
+
+/* Free `ptr` to the heap that allocated it. Any thread. Exact-size contract
+ * matches memento_thread_heap_free. */
+MEMENTO_FORCE_INLINE void memento_thread_heap_free_owned(void* ptr, size_t size) {
+    if (MEMENTO_UNLIKELY(ptr == NULL)) return;
+#if MEMENTO_SIZED
+    memento_thread_heap_free(NULL, ptr, size);
+#else
+    memento_thread_heap_t* owner = memento_thread_heap_of(ptr, size);
+    if (MEMENTO_UNLIKELY(owner == NULL)) return;
+    memento_free_exact(owner, ptr, size);
+#endif
+}
+
 #if !MEMENTO_SIZED
 MEMENTO_ATTR_MALLOC MEMENTO_ATTR_ALLOC_SIZE(2) MEMENTO_ATTR_FLATTEN
 MEMENTO_FORCE_INLINE void* memento_thread_heap_alloc(memento_thread_heap_t* heap, size_t size) {
@@ -1945,12 +1987,15 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
     }
     for (memento_span_t* span = heap->span_list; span; span = span->next) {
         if (span->reclaimed) continue;
+        unsigned pi;
+        for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
+            memento_page_drain(memento_span_page_at(span, pi));
+        }
         if (span->sc >= 0 && (size_t)span->sc < MEMENTO_SIZE_CLASS_COUNT &&
             heap->span_partial[span->sc] == span) {
             continue;
         }
         int busy = 0;
-        unsigned pi;
         for (pi = 1; pi < MEMENTO_PAGES_PER_SPAN; pi++) {
             if (memento_span_page_at(span, pi)->nused) { busy = 1; break; }
         }
@@ -2738,7 +2783,13 @@ static void memento_page_reset(memento_page_t* pg, uint8_t sc) {
 
 static void memento_page_drain(memento_page_t* pg) {
     if (!pg) return;
+    if (MEMENTO_LIKELY(memento_atomic_ptr_load_relaxed(&pg->thread_free) == NULL)) {
+        return;
+    }
+#if MEMENTO_STATS
     memento_thread_heap_t* owner = memento_span_of(pg)->owner;
+#endif
+    size_t bs = memento_size_class_to_size(pg->sc);
     memento_foreign_node_t* n =
         (memento_foreign_node_t*)memento_atomic_ptr_exchange_acq(&pg->thread_free, NULL);
     while (n) {
@@ -2748,7 +2799,6 @@ static void memento_page_drain(memento_page_t* pg) {
         pg->free = n;
         if (pg->nused) pg->nused--;
         {
-            size_t bs = memento_size_class_to_size(pg->sc);
             int idx = memento_page_idx_of(pg, n, bs);
             if (idx >= 0 && (unsigned)idx < pg->nbits) {
                 memento_bmp_set(pg->bmp, (unsigned)idx);
@@ -2756,7 +2806,10 @@ static void memento_page_drain(memento_page_t* pg) {
         }
         n = next;
 #if MEMENTO_STATS
-        if (owner) owner->stats.foreign_free_count++;
+        if (owner) {
+            owner->stats.foreign_free_count++;
+            MEMENTO_STAT_FREE(owner, pg->sc, bs);
+        }
 #endif
     }
 }
@@ -3208,6 +3261,7 @@ MEMENTO_NOINLINE void* memento_fast_alloc_miss(memento_thread_heap_t* MEMENTO_RE
             return ptr;
         }
         memento_page_t* MEMENTO_RESTRICT pg = heap->active[sc];
+        if (pg) memento_page_drain(pg);
         if (MEMENTO_LIKELY(pg != NULL && pg->free != NULL)) {
 #if MEMENTO_STATS
             heap->stats.page_hits++;

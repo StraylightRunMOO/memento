@@ -124,6 +124,19 @@ TEST(containers_still_work_sized) {
     memento_slab_destroy(slab);
 }
 
+TEST(heap_free_owned_sized) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    void* small = memento_thread_heap_alloc(heap, 200);
+    ASSERT_NOT_NULL(small);
+    ASSERT_EQ(memento_thread_heap_of(small, 200), heap);
+    memento_thread_heap_free_owned(small, 0);
+
+    void* large = memento_thread_heap_alloc(heap, 100 * 1024);
+    ASSERT_NOT_NULL(large);
+    ASSERT_EQ(memento_thread_heap_of(large, 100 * 1024), heap);
+    memento_thread_heap_free_owned(large, 0);
+}
+
 int main(void) {
     printf("=== Memento SIZED-Mode Test Suite ===\n\n");
 
@@ -137,6 +150,7 @@ int main(void) {
     RUN_TEST(heap_realloc_sized);
     RUN_TEST(heap_aligned_sized);
     RUN_TEST(containers_still_work_sized);
+    RUN_TEST(heap_free_owned_sized);
 
     memento_shutdown();
 

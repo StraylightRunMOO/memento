@@ -174,6 +174,14 @@ TEST(heap_realloc) {
     h.deallocate(new_ptr, 200);
 }
 
+TEST(heap_deallocate_owned) {
+    memento::heap h;
+    void* ptr = h.allocate(224);
+    ASSERT_NOT_NULL(ptr);
+    h.deallocate_owned(ptr, 224);
+    h.deallocate_owned(nullptr, 0);
+}
+
 TEST(heap_null_deallocate) {
     memento::heap h;
     /* Should not crash */
@@ -702,6 +710,7 @@ int main() {
         RUN_TEST(heap_object_construction);
         RUN_TEST(heap_array_allocation);
         RUN_TEST(heap_realloc);
+        RUN_TEST(heap_deallocate_owned);
         RUN_TEST(heap_null_deallocate);
         RUN_TEST(heap_stats);
         

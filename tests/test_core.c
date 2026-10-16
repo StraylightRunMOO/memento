@@ -184,6 +184,22 @@ TEST(heap_null_ptr_free) {
     memento_thread_heap_free(heap, NULL, 1024);
 }
 
+TEST(heap_free_owned_same_thread) {
+    memento_thread_heap_t* heap = memento_thread_heap_get();
+    void* small = memento_thread_heap_alloc(heap, 224);
+    ASSERT_NOT_NULL(small);
+    ASSERT_EQ(memento_thread_heap_of(small, 224), heap);
+    memento_thread_heap_free_owned(small, 224);
+
+    void* large = memento_thread_heap_alloc(heap, 100 * 1024);
+    ASSERT_NOT_NULL(large);
+    ASSERT_EQ(memento_thread_heap_of(large, 100 * 1024), heap);
+    memento_thread_heap_free_owned(large, 100 * 1024);
+
+    memento_thread_heap_free_owned(NULL, 0);
+    ASSERT_NULL(memento_thread_heap_of(NULL, 0));
+}
+
 TEST(heap_all_size_classes) {
     memento_thread_heap_t* heap = memento_thread_heap_get();
     
@@ -1242,6 +1258,7 @@ int main(void) {
     RUN_TEST(heap_null_heap);
     RUN_TEST(heap_zero_size);
     RUN_TEST(heap_null_ptr_free);
+    RUN_TEST(heap_free_owned_same_thread);
     RUN_TEST(heap_all_size_classes);
     RUN_TEST(heap_mixed_sizes);
     RUN_TEST(heap_large_allocation);

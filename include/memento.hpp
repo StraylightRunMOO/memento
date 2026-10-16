@@ -140,6 +140,11 @@ public:
         memento_thread_heap_free(handle_, ptr, size);
     }
 
+    /* Free to the heap that allocated `ptr` (any thread). */
+    void deallocate_owned(void* ptr, size_t size) {
+        memento_thread_heap_free_owned(ptr, size);
+    }
+
     template<typename T, typename... Args>
     MEMENTO_REQUIRES_ALLOCATABLE
     [[nodiscard]] T* construct(Args&&... args) {

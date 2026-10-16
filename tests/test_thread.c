@@ -97,6 +97,7 @@
 
 #define ASSERT_NOT_NULL(p) ASSERT((p) != NULL)
 #define ASSERT_EQ(a, b) ASSERT((a) == (b))
+#define ASSERT_GE(a, b) ASSERT((a) >= (b))
 
 static int passed = 0;
 static int failed = 0;
@@ -253,6 +254,104 @@ TEST(foreign_free_flush) {
     memento_thread_heap_stats(heap, &stats_after);
     (void)stats_before;
     (void)stats_after;
+}
+
+typedef struct {
+    void* ptr;
+    size_t size;
+} foreign_gift_t;
+
+static MEMENTO_TEST_THREAD_RET thread_free_owned(void* arg) {
+    foreign_gift_t* g = (foreign_gift_t*)arg;
+    (void)memento_thread_heap_get();
+    memento_thread_heap_free_owned(g->ptr, g->size);
+    MEMENTO_TEST_THREAD_RETURN(0);
+}
+
+static int foreign_free_one(void* ptr, size_t size) {
+    foreign_gift_t g;
+    memento_test_thread_t t;
+    g.ptr = ptr;
+    g.size = size;
+    if (memento_test_thread_create(&t, thread_free_owned, &g) != 0) {
+        return -1;
+    }
+    return memento_test_thread_join(t, NULL);
+}
+
+TEST(foreign_free_owned_bytes_live) {
+    memento_thread_heap_t* owner = memento_thread_heap_get();
+    const size_t sz = 224;
+    memento_heap_stats_t before, after_alloc, after_reuse, after_flush;
+    void* p;
+    void* q;
+
+    memento_thread_heap_flush(owner);
+    memento_thread_heap_stats(owner, &before);
+
+    p = memento_thread_heap_alloc(owner, sz);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(memento_thread_heap_of(p, sz), owner);
+
+    /* Dump tcache so the next alloc misses and drains the page. */
+    memento_thread_heap_flush(owner);
+    memento_thread_heap_stats(owner, &after_alloc);
+#if MEMENTO_STATS
+    ASSERT_EQ(after_alloc.bytes_live, before.bytes_live + sz);
+#endif
+
+    ASSERT_EQ(foreign_free_one(p, sz), 0);
+
+    q = memento_thread_heap_alloc(owner, sz);
+    ASSERT_NOT_NULL(q);
+    memento_thread_heap_stats(owner, &after_reuse);
+#if MEMENTO_STATS
+    /* One live block: the foreign free was subtracted on drain, then this
+     * alloc added the class size back. No 224-byte drift. */
+    ASSERT_EQ(after_reuse.bytes_live, after_alloc.bytes_live);
+    ASSERT_GE(after_reuse.foreign_free_count, before.foreign_free_count + 1);
+#endif
+
+    memento_thread_heap_free_owned(q, sz);
+    memento_thread_heap_flush(owner);
+    memento_thread_heap_stats(owner, &after_flush);
+#if MEMENTO_STATS
+    ASSERT_EQ(after_flush.bytes_live, before.bytes_live);
+#endif
+}
+
+TEST(foreign_free_owned_batch_and_large) {
+    memento_thread_heap_t* owner = memento_thread_heap_get();
+    const size_t small = 224;
+    const size_t large = 100 * 1024;
+    const int n = 32;
+    void* ptrs[32];
+    void* big;
+    int i;
+    memento_heap_stats_t before, after;
+
+    memento_thread_heap_flush(owner);
+    memento_thread_heap_stats(owner, &before);
+
+    for (i = 0; i < n; i++) {
+        ptrs[i] = memento_thread_heap_alloc(owner, small);
+        ASSERT_NOT_NULL(ptrs[i]);
+    }
+    big = memento_thread_heap_alloc(owner, large);
+    ASSERT_NOT_NULL(big);
+    ASSERT_EQ(memento_thread_heap_of(big, large), owner);
+
+    for (i = 0; i < n; i++) {
+        ASSERT_EQ(foreign_free_one(ptrs[i], small), 0);
+    }
+    ASSERT_EQ(foreign_free_one(big, large), 0);
+
+    memento_thread_heap_flush(owner);
+    memento_thread_heap_stats(owner, &after);
+#if MEMENTO_STATS
+    ASSERT_EQ(after.bytes_live, before.bytes_live);
+    ASSERT_GE(after.foreign_free_count, before.foreign_free_count + (size_t)n + 1);
+#endif
 }
 
 /* ============================================================================
@@ -487,6 +586,8 @@ int main(void) {
     printf("\nForeign Deallocation Tests:\n");
     RUN_TEST(foreign_free_basic);
     RUN_TEST(foreign_free_flush);
+    RUN_TEST(foreign_free_owned_bytes_live);
+    RUN_TEST(foreign_free_owned_batch_and_large);
 
     printf("\nConcurrent Allocator Tests:\n");
     RUN_TEST(pool_concurrent);
