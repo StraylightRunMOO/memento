@@ -1103,18 +1103,18 @@ MEMENTO_FORCE_INLINE memento_span_t* memento_span_of(const void* ptr) {
 /* 64 KiB page header: lives at the base of each data page (not page 0,
  * which holds the span header). Hit-path nused lives on this line, not
  * 2 MiB away on the span. Foreign frees CAS onto thread_free.
- * Occupancy is exclusive: a set bit means “never handed out / not on
- * pg->free”. Free-to-page only links; bitmap refill claims never-linked
- * slots. Overlapping set-and-link was the 3.0.2 double-handout. */
+ * Occupancy: recycled blocks live on `free` (intrusive). Virgin slots
+ * are bump-carved (`bump` .. `nbits`) with no payload write. The bitmap
+ * array remains so the header size (and payload offset) stay stable. */
 #define MEMENTO_PAGE_BMP_WORDS 32u /* 2048 bits = 256 B, 32 B class worst case */
 
 typedef struct memento_page {
     void* free;
-    uint16_t nfree;
+    uint16_t bump;     /* next never-handed-out slot */
     uint16_t nused;
     uint8_t sc;
     uint8_t state;
-    uint16_t nbits;    /* valid occupancy bits */
+    uint16_t nbits;    /* slots in the payload */
     memento_atomic_ptr_t thread_free;
     struct memento_page* next_partial;
     MEMENTO_ALIGNED(16) uint64_t bmp[MEMENTO_PAGE_BMP_WORDS];
@@ -2759,9 +2759,8 @@ static void memento_page_reset(memento_page_t* pg, uint8_t sc) {
     size_t bs = memento_size_class_to_size(sc);
     size_t off = memento_page_payload_off();
     uint32_t nbits = 0;
-    unsigned i, full, rem;
     pg->free = NULL;
-    pg->nfree = 0;
+    pg->bump = 0;
     pg->nused = 0;
     pg->sc = sc;
     pg->state = 0;
@@ -2778,15 +2777,6 @@ static void memento_page_reset(memento_page_t* pg, uint8_t sc) {
         }
     }
     pg->nbits = (uint16_t)nbits;
-    memset(pg->bmp, 0, sizeof(pg->bmp));
-    full = nbits / 64u;
-    for (i = 0; i < full; i++) {
-        pg->bmp[i] = ~(uint64_t)0;
-    }
-    rem = nbits % 64u;
-    if (rem) {
-        pg->bmp[full] = ((uint64_t)1 << rem) - 1u;
-    }
     memento_pagemap_set(pg);
 }
 
@@ -2820,9 +2810,7 @@ static memento_page_t* memento_span_page_at(memento_span_t* span, unsigned i) {
 }
 
 MEMENTO_FORCE_INLINE int memento_page_has_free(const memento_page_t* pg) {
-    if (pg->free) return 1;
-    if (!pg->nbits) return 0;
-    return memento_bmp_first(pg->bmp, (int)((pg->nbits + 63u) / 64u)) >= 0;
+    return pg->free != NULL || pg->bump < pg->nbits;
 }
 
 static memento_page_t* memento_page_claim_virgin(memento_thread_heap_t* heap,
@@ -2878,9 +2866,7 @@ static memento_page_t* memento_page_acquire(memento_thread_heap_t* heap, size_t 
     return memento_page_claim_virgin(heap, span, sc);
 }
 
-/* Pop one block from the page freelist. The bit is already clear: either
- * it was claimed from the bitmap (cleared on take) or it came back via
- * push_free (which does not set). */ 
+/* Pop one recycled block from the page freelist. */ 
 MEMENTO_FORCE_INLINE void* memento_page_take_free(memento_page_t* pg, size_t block_size) {
     void* ptr = pg->free;
     (void)block_size;
@@ -2890,8 +2876,9 @@ MEMENTO_FORCE_INLINE void* memento_page_take_free(memento_page_t* pg, size_t blo
     return ptr;
 }
 
-/* Pack pg->free into the tcache. Returns how many slots were stored at
- * slot[1..]. Caller pops one when top > 1. */
+/* Pack recycled freelist, then virgin bump slots, into the tcache.
+ * Bump carve does not write the payload. Returns how many slots were
+ * stored at slot[1..]. Caller pops one when top > 1. */
 static uint32_t memento_tcache_fill_from_page(memento_tcache_bin_t* bin,
                                               memento_page_t* pg, size_t bs) {
     uint32_t depth = memento_tcache_depth();
@@ -2899,6 +2886,10 @@ static uint32_t memento_tcache_fill_from_page(memento_tcache_bin_t* bin,
     void* packed[MEMENTO_TCACHE_DEPTH_MAX];
     while ((1u + pk) < depth && pg->free && pk < MEMENTO_TCACHE_DEPTH_MAX) {
         packed[pk++] = memento_page_take_free(pg, bs);
+    }
+    while ((1u + pk) < depth && pg->bump < pg->nbits && pk < MEMENTO_TCACHE_DEPTH_MAX) {
+        packed[pk++] = memento_page_slot(pg, pg->bump++, bs);
+        pg->nused++;
     }
     if (!pk) return 0;
 #if MEMENTO_SIMD_AVX2
@@ -2940,34 +2931,6 @@ static void* memento_refill_size_class(memento_thread_heap_t* MEMENTO_RESTRICT h
 #if MEMENTO_PAGE_SIZE
     memento_page_t* pg = memento_page_acquire(heap, sc, block_size);
     if (MEMENTO_UNLIKELY(!pg)) return NULL;
-    if (!pg->free) {
-        /* Bitmap refill: claim K free bits, link onto pg->free. */
-        int nwords = (int)((pg->nbits + 63u) / 64u);
-        uint32_t batch = MEMENTO_REFILL_BATCH;
-        void* blocks[32];
-        uint32_t k = 0;
-        if (batch > 32) batch = 32;
-        while (k < batch) {
-            int bit = memento_bmp_first(pg->bmp, nwords);
-            if (bit < 0 || (unsigned)bit >= pg->nbits) break;
-            memento_bmp_clear(pg->bmp, (unsigned)bit);
-            blocks[k++] = memento_page_slot(pg, (unsigned)bit, block_size);
-        }
-        if (!k) return NULL;
-        {
-            uint32_t i;
-            void* head = pg->free;
-            for (i = k; i-- > 0; ) {
-                void* b = blocks[i];
-                MEMENTO_ASAN_UNPOISON(b, block_size);
-                memento_debug_mark_free(b);
-                *(void**)b = head;
-                head = b;
-                MEMENTO_ASAN_POISON(b, block_size);
-            }
-            pg->free = head;
-        }
-    }
     {
         memento_tcache_bin_t* bin = &heap->tcache[sc];
         memento_tcache_fill_from_page(bin, pg, block_size);
@@ -2980,6 +2943,13 @@ static void* memento_refill_size_class(memento_thread_heap_t* MEMENTO_RESTRICT h
     }
     if (pg->free) {
         void* ptr = memento_page_take_free(pg, block_size);
+        MEMENTO_ASAN_UNPOISON(ptr, block_size);
+        if (out_fresh) *out_fresh = false;
+        return ptr;
+    }
+    if (pg->bump < pg->nbits) {
+        void* ptr = memento_page_slot(pg, pg->bump++, block_size);
+        pg->nused++;
         MEMENTO_ASAN_UNPOISON(ptr, block_size);
         if (out_fresh) *out_fresh = false;
         return ptr;
@@ -3333,7 +3303,7 @@ MEMENTO_NOINLINE void* memento_fast_alloc_miss(memento_thread_heap_t* MEMENTO_RE
         }
         memento_page_t* MEMENTO_RESTRICT pg = heap->active[sc];
         if (pg) memento_page_drain(pg);
-        if (MEMENTO_LIKELY(pg != NULL && pg->free != NULL)) {
+        if (MEMENTO_LIKELY(pg != NULL && memento_page_has_free(pg))) {
 #if MEMENTO_STATS
             heap->stats.page_hits++;
 #endif
