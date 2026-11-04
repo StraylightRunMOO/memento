@@ -65,9 +65,9 @@
 
 /* Version macros for compile-time checking */
 #define MEMENTO_VERSION_MAJOR 3
-#define MEMENTO_VERSION_MINOR 0
-#define MEMENTO_VERSION_PATCH 3
-#define MEMENTO_VERSION_STRING "3.0.3"
+#define MEMENTO_VERSION_MINOR 1
+#define MEMENTO_VERSION_PATCH 0
+#define MEMENTO_VERSION_STRING "3.1.0"
 #define MEMENTO_VERSION ((MEMENTO_VERSION_MAJOR << 16) | \
                          (MEMENTO_VERSION_MINOR << 8) | \
                          MEMENTO_VERSION_PATCH)
@@ -1143,7 +1143,8 @@ MEMENTO_FORCE_INLINE memento_page_t* memento_page_of(const void* ptr) {
 }
 
 MEMENTO_FORCE_INLINE size_t memento_page_payload_off(void) {
-    return (sizeof(memento_page_t) + 15u) & ~(size_t)15u;
+    return (sizeof(memento_page_t) + (MEMENTO_CACHE_LINE_SIZE - 1u))
+         & ~(size_t)(MEMENTO_CACHE_LINE_SIZE - 1u);
 }
 
 MEMENTO_FORCE_INLINE void memento_bmp_set(uint64_t* b, unsigned bit) {
@@ -1199,8 +1200,9 @@ typedef struct {
 } memento_carve_t;
 #endif
 
-/* Meta header at the start of every page-run / huge mapping (32 bytes, so the
- * user pointer at base+32 keeps 16-byte alignment on a page-aligned base). */
+/* Meta header at the start of every page-run / huge mapping.  Padded to
+ * MEMENTO_CACHE_LINE_SIZE so the user pointer at base+64 keeps cache-line
+ * alignment on a page-aligned base. */
 #define MEMENTO_LARGE_MAGIC 0x4D454D4C41524745ull /* "MEMLARGE" */
 typedef struct {
     uint64_t magic;
@@ -1209,7 +1211,7 @@ typedef struct {
     struct memento_thread_heap_s* owner;
 } memento_large_meta_t;
 
-#define MEMENTO_LARGE_META_SIZE 32u /* sizeof(memento_large_meta_t) */
+#define MEMENTO_LARGE_META_SIZE MEMENTO_CACHE_LINE_SIZE
 
 /* Huge-object cache slot (> MEMENTO_PAGE_RUN_MAX), keyed by page count */
 typedef struct {
@@ -1415,8 +1417,8 @@ MEMENTO_FORCE_INLINE void memento_free_exact(memento_thread_heap_t* heap,
 
 /* Heap that allocated this pointer. `size` is the exact-mode allocation size
  * (same contract as memento_thread_heap_free). Small: span header. Large:
- * 32-byte meta immediately before the user pointer; sized large also tries
- * 16 bytes further back. */
+ * cache-line-sized meta immediately before the user pointer; sized large
+ * also tries 16 bytes further back. */
 MEMENTO_FORCE_INLINE memento_thread_heap_t*
 memento_thread_heap_of(const void* ptr, size_t size) {
     if (MEMENTO_UNLIKELY(ptr == NULL)) return NULL;
@@ -1598,9 +1600,13 @@ MEMENTO_FORCE_INLINE void memento_thread_heap_free(memento_thread_heap_t* heap, 
         #define MEMENTO_FREE(ptr, size) ((void)(size), free(ptr))
     #endif
     #ifndef MEMENTO_ALIGNED_ALLOC
-        /* aligned_alloc requires size multiple of alignment (C11) */
-        #define MEMENTO_ALIGNED_ALLOC(align, size) \
-            aligned_alloc((align), (((size) + (align) - 1) / (align) * (align)))
+        static inline void* memento_posix_memalign_wrap(size_t align, size_t size) {
+            size = ((size) + (align) - 1) / (align) * (align);
+            void* p = NULL;
+            if (posix_memalign(&p, align, size) != 0) return NULL;
+            return p;
+        }
+        #define MEMENTO_ALIGNED_ALLOC(align, size) memento_posix_memalign_wrap((align), (size))
     #endif
     #ifndef MEMENTO_ALIGNED_FREE
         #define MEMENTO_ALIGNED_FREE(ptr) free(ptr)
