@@ -1,5 +1,5 @@
 /*
- * Memento Memory Allocator Library — v3.0.3
+ * Memento Memory Allocator Library — v3.1.1
  *
  * An instrumented multi-strategy allocator for runtimes and dirty libc.
  *
@@ -17,8 +17,9 @@
  * - Stack: LIFO scope-based allocator
  * - Slab:  multi-size object caching
  *
- * Platforms: POSIX (Linux/macOS/BSD, glibc and musl) and Windows
- * (MSVC / MinGW / Clang-CL).
+ * Platforms: POSIX (Linux/macOS/BSD, glibc and musl), Windows
+ * (MSVC / MinGW / Clang-CL), and Wasm/Emscripten (malloc-backed spans;
+ * no virtual reserve, no guard pages, no fork).
  *
  * Threading contract:
  * - memento_thread_heap_alloc / realloc / flush: owning thread only
@@ -66,8 +67,8 @@
 /* Version macros for compile-time checking */
 #define MEMENTO_VERSION_MAJOR 3
 #define MEMENTO_VERSION_MINOR 1
-#define MEMENTO_VERSION_PATCH 0
-#define MEMENTO_VERSION_STRING "3.1.0"
+#define MEMENTO_VERSION_PATCH 1
+#define MEMENTO_VERSION_STRING "3.1.1"
 #define MEMENTO_VERSION ((MEMENTO_VERSION_MAJOR << 16) | \
                          (MEMENTO_VERSION_MINOR << 8) | \
                          MEMENTO_VERSION_PATCH)
@@ -109,6 +110,11 @@ extern "C" {
 #else
     #define MEMENTO_PLATFORM_WINDOWS 0
     #define MEMENTO_PLATFORM_POSIX 1
+#endif
+#if defined(__EMSCRIPTEN__) || defined(__wasm__)
+    #define MEMENTO_PLATFORM_WASM 1
+#else
+    #define MEMENTO_PLATFORM_WASM 0
 #endif
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -218,18 +224,30 @@ extern "C" {
  * mapping so a worker's 64 B warmup does not commit 24 MiB. 0/1 = one
  * span at a time. */
 #ifndef MEMENTO_SPAN_PREFETCH
-    #define MEMENTO_SPAN_PREFETCH 12u
+    #if MEMENTO_PLATFORM_WASM
+        #define MEMENTO_SPAN_PREFETCH 1u
+    #else
+        #define MEMENTO_SPAN_PREFETCH 12u
+    #endif
 #endif
 
 #ifndef MEMENTO_CPU_HEAPS
-    #define MEMENTO_CPU_HEAPS 1
+    #if MEMENTO_PLATFORM_WASM
+        #define MEMENTO_CPU_HEAPS 0
+    #else
+        #define MEMENTO_CPU_HEAPS 1
+    #endif
 #endif
 #ifndef MEMENTO_CPU_MAX
     #define MEMENTO_CPU_MAX 256
 #endif
 
 #ifndef MEMENTO_VA_RESERVE
-    #define MEMENTO_VA_RESERVE (256ull * 1024ull * 1024ull)
+    #if MEMENTO_PLATFORM_WASM
+        #define MEMENTO_VA_RESERVE 0
+    #else
+        #define MEMENTO_VA_RESERVE (256ull * 1024ull * 1024ull)
+    #endif
 #endif
 #ifndef MEMENTO_GLOBAL_PAGE_CACHE
     #define MEMENTO_GLOBAL_PAGE_CACHE 64
@@ -364,12 +382,20 @@ extern "C" {
 
 /* NUMA first-touch / node tagging (disable with -DMEMENTO_ENABLE_NUMA=0) */
 #ifndef MEMENTO_ENABLE_NUMA
-    #define MEMENTO_ENABLE_NUMA 1
+    #if MEMENTO_PLATFORM_WASM
+        #define MEMENTO_ENABLE_NUMA 0
+    #else
+        #define MEMENTO_ENABLE_NUMA 1
+    #endif
 #endif
 
-/* Transparent huge pages via madvise (POSIX); no-op on Windows */
+/* Transparent huge pages via madvise (POSIX); no-op on Windows / Wasm */
 #ifndef MEMENTO_ENABLE_THP
-    #define MEMENTO_ENABLE_THP 1
+    #if MEMENTO_PLATFORM_WASM
+        #define MEMENTO_ENABLE_THP 0
+    #else
+        #define MEMENTO_ENABLE_THP 1
+    #endif
 #endif
 
 /* AddressSanitizer freelist poison/unpoison (auto if ASan is active) */
@@ -1612,11 +1638,29 @@ MEMENTO_FORCE_INLINE void memento_thread_heap_free(memento_thread_heap_t* heap, 
         #define MEMENTO_ALIGNED_FREE(ptr) free(ptr)
     #endif
     #ifndef MEMENTO_MMAP
-        #define MEMENTO_MMAP(size) \
-            mmap(NULL, (size), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+        #if MEMENTO_PLATFORM_WASM
+            /* Emscripten mmap is malloc-backed; partial munmap is invalid.
+             * Exact-size posix_memalign so span alignment is real. */
+            static inline void* memento_wasm_map(size_t size) {
+                size_t a = 4096;
+                if (size > SIZE_MAX - (a - 1)) return NULL;
+                size = (size + a - 1) & ~(a - 1);
+                void* p = NULL;
+                if (posix_memalign(&p, a, size) != 0) return NULL;
+                return p;
+            }
+            #define MEMENTO_MMAP(size) memento_wasm_map(size)
+        #else
+            #define MEMENTO_MMAP(size) \
+                mmap(NULL, (size), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
+        #endif
     #endif
     #ifndef MEMENTO_MUNMAP
-        #define MEMENTO_MUNMAP(ptr, size) munmap((ptr), (size))
+        #if MEMENTO_PLATFORM_WASM
+            #define MEMENTO_MUNMAP(ptr, size) ((void)(size), free(ptr))
+        #else
+            #define MEMENTO_MUNMAP(ptr, size) munmap((ptr), (size))
+        #endif
     #endif
 
     static pthread_mutex_t memento_registry_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2051,7 +2095,7 @@ void memento_foreign_push(memento_thread_heap_t* heap, void* ptr, size_t size) {
 /* Drain foreign frees, grouped by size class so the subsequent local frees
  * hit one cache line per class. Grouping is a bucket-prepend per class —
  * O(n) pointer swaps, no comparison sort, no item array shuffling. */
-#if MEMENTO_PLATFORM_POSIX && defined(__linux__)
+#if MEMENTO_PLATFORM_POSIX && defined(__linux__) && !MEMENTO_PLATFORM_WASM
 static void memento_span_collapse_once(memento_span_t* s);
 #endif
 
@@ -2103,7 +2147,7 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
         }
     }
 #endif
-#if MEMENTO_PLATFORM_POSIX && defined(__linux__)
+#if MEMENTO_PLATFORM_POSIX && defined(__linux__) && !MEMENTO_PLATFORM_WASM
     {
         /* THP collapse is a hint for long-lived heaps (Linux 6.1+). Doing it
          * on every flush is a syscall per span per idle tick — and on 5.15
@@ -2176,7 +2220,7 @@ void memento_thread_heap_flush(memento_thread_heap_t* heap) {
  * feature-test macros under strict -std=c11; on Linux the syscall number
  * and the MADV_DONTNEED value (4) are frozen kernel UAPI, so call through
  * the syscall layer as the final fallback. */
-#if MEMENTO_PLATFORM_POSIX && defined(__linux__) && defined(SYS_madvise)
+#if MEMENTO_PLATFORM_POSIX && defined(__linux__) && !MEMENTO_PLATFORM_WASM && defined(SYS_madvise)
 #ifdef __THROW
 extern long syscall(long number, ...) __THROW;
 #else
@@ -2184,7 +2228,7 @@ extern long syscall(long number, ...);
 #endif
 #endif
 
-#if MEMENTO_PLATFORM_POSIX && defined(__linux__)
+#if MEMENTO_PLATFORM_POSIX && defined(__linux__) && !MEMENTO_PLATFORM_WASM
 #ifndef MADV_COLLAPSE
 #define MADV_COLLAPSE 25
 #endif
@@ -2344,6 +2388,7 @@ static void memento_va_init(void) {
     }
 #endif
     memento_va_cap = (size_t)MEMENTO_VA_RESERVE;
+    if (memento_va_cap == 0) { memento_va_ready = -1; return; }
 #if MEMENTO_PLATFORM_POSIX
     #ifndef MAP_NORESERVE
         #define MAP_NORESERVE 0
@@ -2520,7 +2565,7 @@ static int memento_gspan_push(memento_span_t* s) {
 static unsigned memento_current_cpu(void) {
 #if MEMENTO_PLATFORM_WINDOWS
     return (unsigned)GetCurrentProcessorNumber() % MEMENTO_CPU_MAX;
-#elif defined(__linux__) && defined(SYS_getcpu)
+#elif defined(__linux__) && !MEMENTO_PLATFORM_WASM && defined(SYS_getcpu)
     {
         unsigned cpu = 0, node = 0;
         long rc = syscall(SYS_getcpu, &cpu, &node, (void*)0);
@@ -2543,7 +2588,18 @@ static void* memento_os_alloc_aligned(size_t size, size_t align) {
             return bumped;
         }
     }
-#if MEMENTO_PLATFORM_POSIX
+#if MEMENTO_PLATFORM_WASM
+    /* Linear memory cannot punch holes, so overmap-and-trim is invalid.
+     * posix_memalign hands back an exact, span-aligned block. */
+    if (align < sizeof(void*)) align = sizeof(void*);
+    if (size > SIZE_MAX - (align - 1)) return NULL;
+    size = memento_align_up(size, align);
+    {
+        void* p = NULL;
+        if (posix_memalign(&p, align, size) != 0) return NULL;
+        return p;
+    }
+#elif MEMENTO_PLATFORM_POSIX
     if (align < 4096) align = 4096;
     if (size > SIZE_MAX - align) return NULL;
     size_t total = size + align;
@@ -4489,6 +4545,18 @@ struct memento_arena_s {
 static memento_arena_block_t* memento_arena_block_guarded(size_t capacity) {
     size_t live = memento_align_up(MEMENTO_ARENA_HEADER_SIZE + capacity, 4096);
     if (live > SIZE_MAX - 4096) return NULL;
+#if MEMENTO_PLATFORM_WASM
+    /* No sub-region PROT_NONE in linear memory. Map the live size only. */
+    {
+        char* base = (char*)MEMENTO_MMAP(live);
+        if (!base) return NULL;
+        memento_arena_block_t* block = (memento_arena_block_t*)base;
+        block->next = NULL;
+        block->size = capacity;
+        block->map_size = live;
+        return block;
+    }
+#endif
     size_t mapped = live + 4096; /* trailing guard page */
 #if MEMENTO_PLATFORM_POSIX
     char* base = (char*)MEMENTO_MMAP(mapped);
@@ -5855,7 +5923,7 @@ static void memento_thread_exit_destructor(void* arg) {
     memento_tls_heap = NULL;
 }
 
-#if MEMENTO_PLATFORM_POSIX
+#if MEMENTO_PLATFORM_POSIX && !MEMENTO_PLATFORM_WASM
 /* Bumped in the fork child. Embedders that cache heap pointers (a wrapper
  * struct, a memoized memento_thread_heap_get()) can compare generations to
  * detect that their cached heap is now retired state. Plain storage: it is

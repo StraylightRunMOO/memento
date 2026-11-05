@@ -30,7 +30,9 @@ int main(void) {
 }
 ```
 
-MIT licensed. C11, C++17 wrapper included, Linux/macOS/Windows.
+MIT licensed. C11, C++17 wrapper included, Linux/macOS/Windows, and
+Wasm/Emscripten (`MEMENTO_PLATFORM_WASM`: malloc-backed spans, no virtual
+reserve, no `mprotect` guard pages, no `fork`).
 
 ---
 

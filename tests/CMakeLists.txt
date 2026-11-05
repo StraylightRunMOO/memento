@@ -68,6 +68,12 @@ target_compile_definitions(test_nostats PRIVATE MEMENTO_STATS=0)
 target_link_libraries(test_nostats PRIVATE Threads::Threads)
 add_test(NAME nostats COMMAND test_nostats)
 
+# Wasm/Emscripten smoke (compiles natively too: init, malloc, guarded arena)
+add_executable(test_wasm_smoke test_wasm_smoke.c)
+target_include_directories(test_wasm_smoke PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(test_wasm_smoke PRIVATE Threads::Threads)
+add_test(NAME wasm_smoke COMMAND test_wasm_smoke)
+
 # C++ tests
 add_executable(test_cpp test_cpp.cpp)
 target_include_directories(test_cpp PRIVATE ${CMAKE_SOURCE_DIR}/include)
@@ -78,13 +84,13 @@ add_test(NAME cpp COMMAND test_cpp)
 # MSVC: silence CRT secure warnings
 if(MSVC)
     foreach(t test_core test_thread test_sized test_sized_mode test_nostats test_proxy
-               test_proxy_release test_lifecycle test_debug test_bitmap test_cpp)
+               test_proxy_release test_lifecycle test_debug test_bitmap test_wasm_smoke test_cpp)
         target_compile_definitions(${t} PRIVATE _CRT_SECURE_NO_WARNINGS)
     endforeach()
 endif()
 
 set_tests_properties(core thread sized sized_mode proxy proxy_release
-                     lifecycle debug bitmap cpp PROPERTIES
+                     lifecycle debug bitmap wasm_smoke cpp PROPERTIES
     TIMEOUT 120
     ENVIRONMENT "MEMENTO_TEST=1"
 )
